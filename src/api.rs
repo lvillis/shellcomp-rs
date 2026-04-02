@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use crate::error::Result;
 use crate::infra::{env::Environment, paths};
 use crate::model::{
-    ActivationPolicy, InstallReport, InstallRequest, RemoveReport, Shell, UninstallRequest,
+    ActivationPolicy, InstallReport, InstallRequest, MigrateManagedBlocksReport,
+    MigrateManagedBlocksRequest, RemoveReport, Shell, UninstallRequest,
 };
-use crate::service::{detect, install, uninstall};
+use crate::service::{detect, install, migrate, uninstall};
 
 /// Returns the default managed install path for a shell and binary name.
 ///
@@ -187,6 +188,18 @@ pub fn detect_activation_at_path(
     target_path: &Path,
 ) -> Result<crate::ActivationReport> {
     detect::execute_at_path(&Environment::system(), shell, program_name, target_path)
+}
+
+/// Removes caller-provided legacy managed markers and upserts the equivalent `shellcomp` block.
+///
+/// This helper is intended for CLI projects that previously shipped their own managed completion
+/// blocks and want to migrate to `shellcomp` without leaving duplicate startup wiring behind.
+///
+/// For shells that do not use a managed startup file, such as Fish, this operation is a no-op.
+pub fn migrate_managed_blocks(
+    request: MigrateManagedBlocksRequest<'_>,
+) -> Result<MigrateManagedBlocksReport> {
+    migrate::execute(&Environment::system(), request)
 }
 
 #[cfg(feature = "clap")]

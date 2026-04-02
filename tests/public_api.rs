@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use shellcomp::{
     ActivationMode, ActivationPolicy, Availability, Error, FailureKind, FileChange, InstallRequest,
-    Shell, UninstallRequest, default_install_path, detect_activation_at_path, install,
-    install_with_policy, uninstall, uninstall_with_policy,
+    LegacyManagedBlock, MigrateManagedBlocksRequest, Shell, UninstallRequest, default_install_path,
+    detect_activation_at_path, install, install_with_policy, migrate_managed_blocks, uninstall,
+    uninstall_with_policy,
 };
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -15,6 +17,13 @@ fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("shellcomp-it-{label}-{unique}"));
     std::fs::create_dir_all(&path).expect("temp dir should be creatable");
     path
+}
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock should not be poisoned")
 }
 
 #[test]
@@ -173,6 +182,98 @@ fn detect_activation_at_path_reports_status_for_custom_fish_path() {
 
     assert_eq!(report.mode, ActivationMode::Manual);
     assert_eq!(report.availability, Availability::Unknown);
+}
+
+#[test]
+fn powershell_default_install_uses_managed_profile_via_public_api() {
+    let _guard = env_lock();
+    let temp_root = temp_dir("powershell-managed");
+    let home = temp_root.join("home");
+    std::fs::create_dir_all(&home).expect("home should be creatable");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+    let old_xdg_data = std::env::var_os("XDG_DATA_HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    let report = install(InstallRequest {
+        shell: Shell::Powershell,
+        program_name: "demo",
+        script: b"# powershell completion\n",
+        path_override: None,
+    })
+    .expect("powershell install should succeed");
+
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_xdg_config {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_xdg_data {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    assert_eq!(report.activation.mode, ActivationMode::ManagedRcBlock);
+    assert_eq!(
+        report.activation.availability,
+        Availability::AvailableAfterNewShell
+    );
+}
+
+#[test]
+fn migrate_managed_blocks_rewrites_legacy_markers_via_public_api() {
+    let _guard = env_lock();
+    let temp_root = temp_dir("migrate-public");
+    let home = temp_root.join("home");
+    let bashrc = home.join(".bashrc");
+    std::fs::create_dir_all(&home).expect("home should be creatable");
+    std::fs::write(
+        &bashrc,
+        "# >>> legacy demo >>>\n. '/tmp/demo'\n# <<< legacy demo <<<\n",
+    )
+    .expect("bashrc should be writable");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg_data = std::env::var_os("XDG_DATA_HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    let report = migrate_managed_blocks(MigrateManagedBlocksRequest {
+        shell: Shell::Bash,
+        program_name: "demo",
+        path_override: None,
+        legacy_blocks: vec![LegacyManagedBlock {
+            start_marker: "# >>> legacy demo >>>".to_owned(),
+            end_marker: "# <<< legacy demo <<<".to_owned(),
+        }],
+    })
+    .expect("migration should succeed");
+
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_xdg_data {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+
+    assert_eq!(report.legacy_change, FileChange::Removed);
+    let rendered = std::fs::read_to_string(bashrc).expect("bashrc should remain readable");
+    assert!(rendered.contains("shellcomp bash demo"));
+    assert!(!rendered.contains("legacy demo"));
 }
 
 #[cfg(feature = "clap")]

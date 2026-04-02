@@ -1,5 +1,6 @@
 pub(crate) mod detect;
 pub(crate) mod install;
+pub(crate) mod migrate;
 pub(crate) mod uninstall;
 
 use std::path::{Path, PathBuf};

@@ -80,9 +80,9 @@ pub enum ActivationMode {
 pub enum ActivationPolicy {
     /// Let `shellcomp` apply the shell's managed activation behavior when supported.
     ///
-    /// For Bash and Zsh this may update startup files. For Fish, PowerShell, and Elvish the best
-    /// available automatic behavior may still be a manual activation report if no safe managed
-    /// wiring exists.
+    /// For Bash, Zsh, PowerShell, and Elvish this may update managed startup files. Fish keeps
+    /// using its native completions directory, and unsupported or incompatible targets may still
+    /// fall back to a manual activation report.
     AutoManaged,
     /// Write or remove the completion file without attempting managed activation wiring.
     Manual,
@@ -113,6 +113,8 @@ pub enum Operation {
     Install,
     /// Detect activation status for a completion.
     DetectActivation,
+    /// Rewrite or adopt managed shell startup blocks during migration.
+    MigrateManagedBlocks,
     /// Remove a completion script and its activation wiring.
     Uninstall,
 }
@@ -191,6 +193,36 @@ pub struct UninstallRequest<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Caller-provided marker pair for a legacy managed shell block.
+///
+/// Use this with [`crate::migrate_managed_blocks`] when adopting `shellcomp` in a CLI that
+/// previously managed its own shell startup block markers.
+pub struct LegacyManagedBlock {
+    /// Start marker that uniquely identifies the legacy managed block.
+    pub start_marker: String,
+    /// Matching end marker for the legacy managed block.
+    pub end_marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Input for managed-block migration into `shellcomp` markers.
+///
+/// This API rewrites a shell startup file to remove known legacy markers and upsert the equivalent
+/// `shellcomp` managed block for the same shell and completion target path.
+pub struct MigrateManagedBlocksRequest<'a> {
+    /// Target shell whose managed startup block should be adopted.
+    pub shell: Shell,
+    /// Binary name used by the completion script.
+    pub program_name: &'a str,
+    /// Optional explicit completion file path to adopt.
+    ///
+    /// When omitted, `shellcomp` resolves the shell's managed default completion path.
+    pub path_override: Option<PathBuf>,
+    /// Caller-provided legacy marker pairs to remove before writing the `shellcomp` block.
+    pub legacy_blocks: Vec<LegacyManagedBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Structured result of a completion install operation.
 ///
 /// The report is designed for caller-side rendering. `shellcomp` does not print user-facing output
@@ -253,6 +285,23 @@ pub struct RemoveReport {
     ///
     /// This always includes [`RemoveReport::target_path`] and may also include a managed startup
     /// file when shell wiring cleanup was attempted.
+    pub affected_locations: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Structured result of migrating legacy managed startup blocks into `shellcomp`.
+pub struct MigrateManagedBlocksReport {
+    /// Target shell.
+    pub shell: Shell,
+    /// Completion file path associated with the migrated managed block.
+    pub target_path: PathBuf,
+    /// Startup file updated during migration, when the shell uses one.
+    pub location: Option<PathBuf>,
+    /// Outcome of removing any caller-provided legacy blocks.
+    pub legacy_change: FileChange,
+    /// Outcome of writing the `shellcomp` managed block.
+    pub managed_change: FileChange,
+    /// Files touched or inspected while completing migration.
     pub affected_locations: Vec<PathBuf>,
 }
 

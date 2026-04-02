@@ -7,8 +7,9 @@ use crate::infra::{
     managed_block::{self, ManagedBlock},
     paths,
 };
+use crate::model::LegacyManagedBlock;
 use crate::model::{ActivationMode, ActivationReport, Availability, CleanupReport, Shell};
-use crate::shell::{ActivationOutcome, CleanupOutcome};
+use crate::shell::{ActivationOutcome, CleanupOutcome, MigrationOutcome, migrate_profile_blocks};
 
 const BASH_LOADER_PATHS: &[&str] = &[
     "/usr/share/bash-completion/bash_completion",
@@ -21,7 +22,7 @@ const BASH_LOADER_PATHS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoaderStatus {
     ActiveNow,
-    WiredInBashrc,
+    WiredInStartup(PathBuf),
     PresentButUnwired,
     Absent,
 }
@@ -35,7 +36,7 @@ pub(crate) fn install(
     let can_use_system_loader = target_uses_system_loader_path(env, program_name, target_path);
 
     let loader_status = if can_use_system_loader {
-        Some(loader_status(env, &rc_path)?)
+        Some(loader_status(env)?)
     } else {
         None
     };
@@ -57,22 +58,22 @@ pub(crate) fn install(
                     affected_locations: Vec::new(),
                 });
             }
-            LoaderStatus::WiredInBashrc => {
+            LoaderStatus::WiredInStartup(startup_path) => {
                 return Ok(ActivationOutcome {
                     report: ActivationReport {
                         mode: ActivationMode::SystemLoader,
                         availability: Availability::AvailableAfterNewShell,
-                        location: Some(rc_path.clone()),
-                        reason: Some(
-                            "Detected ~/.bashrc wiring for a system bash-completion loader."
-                                .to_owned(),
-                        ),
+                        location: Some(startup_path.clone()),
+                        reason: Some(format!(
+                            "Detected startup-file wiring for a system bash-completion loader in `{}`.",
+                            startup_path.display()
+                        )),
                         next_step: Some(
                             "Start a new Bash session to ensure the completion script is loaded."
                                 .to_owned(),
                         ),
                     },
-                    affected_locations: vec![rc_path],
+                    affected_locations: vec![startup_path.clone()],
                 });
             }
             LoaderStatus::PresentButUnwired | LoaderStatus::Absent => {}
@@ -91,7 +92,7 @@ pub(crate) fn install(
                 Some(LoaderStatus::PresentButUnwired) => {
                     "A known bash-completion loader file exists on disk, but ~/.bashrc does not appear to source it, so shellcomp added a managed block to ~/.bashrc.".to_owned()
                 }
-                Some(LoaderStatus::Absent | LoaderStatus::ActiveNow | LoaderStatus::WiredInBashrc) => {
+                Some(LoaderStatus::Absent | LoaderStatus::ActiveNow | LoaderStatus::WiredInStartup(_)) => {
                     "No system bash-completion loader was detected, so shellcomp added a managed block to ~/.bashrc."
                         .to_owned()
                 }
@@ -146,7 +147,7 @@ pub(crate) fn detect(
     let rc_path = bashrc_path(env)?;
     let can_use_system_loader = target_uses_system_loader_path(env, program_name, target_path);
     let loader_status = if can_use_system_loader {
-        Some(loader_status(env, &rc_path)?)
+        Some(loader_status(env)?)
     } else {
         None
     };
@@ -154,7 +155,7 @@ pub(crate) fn detect(
     if !fs::file_exists(target_path) {
         let mode = if matches!(
             loader_status,
-            Some(LoaderStatus::ActiveNow | LoaderStatus::WiredInBashrc)
+            Some(LoaderStatus::ActiveNow | LoaderStatus::WiredInStartup(_))
         ) {
             ActivationMode::SystemLoader
         } else {
@@ -189,14 +190,15 @@ pub(crate) fn detect(
                     next_step: None,
                 });
             }
-            LoaderStatus::WiredInBashrc => {
+            LoaderStatus::WiredInStartup(startup_path) => {
                 return Ok(ActivationReport {
                     mode: ActivationMode::SystemLoader,
                     availability: Availability::AvailableAfterNewShell,
-                    location: Some(rc_path.clone()),
-                    reason: Some(
-                        "Detected ~/.bashrc wiring for a system bash-completion loader.".to_owned(),
-                    ),
+                    location: Some(startup_path.clone()),
+                    reason: Some(format!(
+                        "Detected startup-file wiring for a system bash-completion loader in `{}`.",
+                        startup_path.display()
+                    )),
                     next_step: Some(
                         "Start a new Bash session if completions are not available yet.".to_owned(),
                     ),
@@ -231,6 +233,24 @@ pub(crate) fn detect(
     })
 }
 
+pub(crate) fn migrate(
+    env: &Environment,
+    program_name: &str,
+    target_path: &Path,
+    legacy_blocks: &[LegacyManagedBlock],
+) -> Result<MigrationOutcome> {
+    let rc_path = bashrc_path(env)?;
+    let block = managed_block(program_name, target_path)?;
+    let (legacy_change, managed_change) = migrate_profile_blocks(&rc_path, legacy_blocks, &block)?;
+
+    Ok(MigrationOutcome {
+        location: Some(rc_path.clone()),
+        managed_change,
+        legacy_change,
+        affected_locations: vec![rc_path],
+    })
+}
+
 fn managed_block(program_name: &str, target_path: &Path) -> Result<ManagedBlock> {
     let quoted = shell_quote(target_path)?;
     Ok(ManagedBlock {
@@ -261,13 +281,13 @@ fn target_uses_system_loader_path(
         .unwrap_or(false)
 }
 
-fn loader_status(env: &Environment, bashrc_path: &Path) -> Result<LoaderStatus> {
+fn loader_status(env: &Environment) -> Result<LoaderStatus> {
     if loader_active_now(env) {
         return Ok(LoaderStatus::ActiveNow);
     }
 
-    if bashrc_sources_loader(env, bashrc_path)? {
-        return Ok(LoaderStatus::WiredInBashrc);
+    if let Some(startup_path) = startup_file_wiring(env)? {
+        return Ok(LoaderStatus::WiredInStartup(startup_path));
     }
 
     if loader_file_present(env) {
@@ -283,8 +303,61 @@ fn loader_file_present(env: &Environment) -> bool {
         .any(|path| env.path_exists(Path::new(path)))
 }
 
-fn bashrc_sources_loader(env: &Environment, bashrc_path: &Path) -> Result<bool> {
-    let Some(contents) = read_utf8_file_if_exists(bashrc_path)? else {
+fn startup_file_wiring(env: &Environment) -> Result<Option<PathBuf>> {
+    for startup_path in startup_files(env)? {
+        if startup_file_sources_loader(env, &startup_path)? {
+            return Ok(Some(startup_path));
+        }
+
+        if let Some(profile_script) = startup_file_sources_profile_script(env, &startup_path)? {
+            return Ok(Some(profile_script));
+        }
+    }
+
+    Ok(None)
+}
+
+fn startup_files(env: &Environment) -> Result<Vec<PathBuf>> {
+    let mut files = vec![
+        PathBuf::from("/etc/bashrc"),
+        PathBuf::from("/etc/bash.bashrc"),
+    ];
+    if let Ok(home) = env.home_dir() {
+        push_unique_path(&mut files, home.join(".bashrc"));
+    }
+
+    push_unique_path(&mut files, PathBuf::from("/etc/profile"));
+    if let Ok(home) = env.home_dir()
+        && let Some(login_file) = first_existing_login_startup_file(env, &home)?
+    {
+        push_unique_path(&mut files, login_file);
+    }
+
+    Ok(files)
+}
+
+fn first_existing_login_startup_file(env: &Environment, home: &Path) -> Result<Option<PathBuf>> {
+    for candidate in [
+        home.join(".bash_profile"),
+        home.join(".bash_login"),
+        home.join(".profile"),
+    ] {
+        if env.read_file_if_exists(&candidate)?.is_some() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn startup_file_sources_loader(env: &Environment, startup_path: &Path) -> Result<bool> {
+    let Some(contents) = read_utf8_file_if_exists(env, startup_path)? else {
         return Ok(false);
     };
 
@@ -294,10 +367,107 @@ fn bashrc_sources_loader(env: &Environment, bashrc_path: &Path) -> Result<bool> 
         .any(|path| contents.lines().any(|line| line_sources_loader(line, path))))
 }
 
+fn startup_file_sources_profile_script(
+    env: &Environment,
+    startup_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let Some(contents) = read_utf8_file_if_exists(env, startup_path)? else {
+        return Ok(None);
+    };
+
+    for profile_dir in [
+        Path::new("/etc/profile.d"),
+        Path::new("/usr/local/etc/profile.d"),
+        Path::new("/opt/homebrew/etc/profile.d"),
+    ] {
+        for target in direct_profile_script_targets(&contents, profile_dir) {
+            if startup_file_sources_loader(env, &target)? {
+                return Ok(Some(target));
+            }
+        }
+
+        let walk_mode = contents
+            .lines()
+            .find_map(|line| line_walks_profile_dir(line, profile_dir));
+        if let Some(walk_mode) = walk_mode {
+            let mut entries = env.read_dir_entries(profile_dir)?;
+            entries.sort();
+            for entry in entries {
+                if !profile_dir_entry_matches_walk_mode(&entry, walk_mode) {
+                    continue;
+                }
+
+                if startup_file_sources_loader(env, &entry)? {
+                    return Ok(Some(entry));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn line_sources_loader(line: &str, loader_path: &str) -> bool {
+    line_source_targets(line).contains(&loader_path)
+}
+
+fn direct_profile_script_targets(contents: &str, profile_dir: &Path) -> Vec<PathBuf> {
+    let Some(profile_dir) = profile_dir.to_str() else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .flat_map(line_source_targets)
+        .filter(|target| target.starts_with(profile_dir))
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum ProfileDirWalkMode {
+    GlobSh,
+    RunParts,
+}
+
+fn line_walks_profile_dir(line: &str, profile_dir: &Path) -> Option<ProfileDirWalkMode> {
+    let profile_dir = profile_dir.to_str()?;
     let trimmed = line.trim_start();
     if trimmed.is_empty() || trimmed.starts_with('#') {
-        return false;
+        return None;
+    }
+
+    if !trimmed.contains(profile_dir) {
+        return None;
+    }
+
+    if trimmed.contains("*.sh") {
+        return Some(ProfileDirWalkMode::GlobSh);
+    }
+
+    if trimmed.contains("run-parts") {
+        return Some(ProfileDirWalkMode::RunParts);
+    }
+
+    None
+}
+
+fn profile_dir_entry_matches_walk_mode(path: &Path, mode: ProfileDirWalkMode) -> bool {
+    match mode {
+        ProfileDirWalkMode::GlobSh => {
+            path.extension().and_then(|value| value.to_str()) == Some("sh")
+        }
+        ProfileDirWalkMode::RunParts => path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| !value.contains('.')),
+    }
+}
+
+fn line_source_targets(line: &str) -> Vec<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Vec::new();
     }
 
     trimmed
@@ -306,41 +476,44 @@ fn line_sources_loader(line: &str, loader_path: &str) -> bool {
         .map(str::trim)
         .map(|command| command.strip_prefix("then ").unwrap_or(command))
         .map(|command| command.strip_prefix("do ").unwrap_or(command))
-        .any(|command| command_sources_loader(command, loader_path))
+        .filter_map(command_source_target)
+        .collect()
 }
 
-fn command_sources_loader(command: &str, loader_path: &str) -> bool {
-    let Some(remainder) = command
+fn command_source_target(command: &str) -> Option<&str> {
+    let remainder = command
         .strip_prefix("source ")
-        .or_else(|| command.strip_prefix(". "))
-    else {
-        return false;
-    };
+        .or_else(|| command.strip_prefix(". "))?;
 
-    let Some(token) = remainder.split_whitespace().next() else {
-        return false;
-    };
-
-    token == loader_path
-        || token
-            .strip_prefix('\'')
-            .and_then(|value| value.strip_suffix('\''))
-            == Some(loader_path)
-        || token
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            == Some(loader_path)
+    remainder
+        .split_whitespace()
+        .next()
+        .map(unquote_shell_token)
+        .filter(|value| !value.is_empty())
 }
 
-fn read_utf8_file_if_exists(path: &Path) -> Result<Option<String>> {
-    match std::fs::read(path) {
-        Ok(contents) => String::from_utf8(contents)
-            .map(Some)
-            .map_err(|_| Error::InvalidUtf8File {
-                path: path.to_path_buf(),
-            }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::io("read file", path, source)),
+fn unquote_shell_token(token: &str) -> &str {
+    token
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            token
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(token)
+}
+
+fn read_utf8_file_if_exists(env: &Environment, path: &Path) -> Result<Option<String>> {
+    match env.read_file_if_exists(path)? {
+        Some(contents) => {
+            String::from_utf8(contents)
+                .map(Some)
+                .map_err(|_| Error::InvalidUtf8File {
+                    path: path.to_path_buf(),
+                })
+        }
+        None => Ok(None),
     }
 }
 
@@ -351,7 +524,7 @@ fn loader_active_now(env: &Environment) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::{LoaderStatus, detect, install, loader_active_now, loader_status};
     use crate::infra::env::Environment;
@@ -360,8 +533,7 @@ mod tests {
     #[test]
     fn loader_status_is_active_when_env_hint_is_present() {
         let env = Environment::test().with_var("BASH_COMPLETION_VERSINFO", "2");
-        let status =
-            loader_status(&env, Path::new("/tmp/ignored-bashrc")).expect("status should resolve");
+        let status = loader_status(&env).expect("status should resolve");
 
         assert_eq!(status, LoaderStatus::ActiveNow);
         assert!(loader_active_now(&env));
@@ -372,31 +544,186 @@ mod tests {
         let env = Environment::test()
             .without_var("BASH_COMPLETION_VERSINFO")
             .with_existing_path("/usr/share/bash-completion/bash_completion");
-        let status =
-            loader_status(&env, Path::new("/tmp/ignored-bashrc")).expect("status should resolve");
+        let status = loader_status(&env).expect("status should resolve");
 
         assert_eq!(status, LoaderStatus::PresentButUnwired);
     }
 
     #[test]
-    fn loader_status_is_wired_when_bashrc_sources_known_loader() {
-        let temp_root = crate::tests::temp_dir("bash-loader-wired");
+    fn loader_status_is_wired_when_bash_profile_sources_known_loader() {
+        let temp_root = crate::tests::temp_dir("bash-loader-bash-profile");
         let home = temp_root.join("home");
         fs::create_dir_all(&home).expect("home should be creatable");
         fs::write(
-            home.join(".bashrc"),
+            home.join(".bash_profile"),
             "source /usr/share/bash-completion/bash_completion\n",
         )
-        .expect(".bashrc should be writable");
+        .expect(".bash_profile should be writable");
 
         let env = Environment::test()
             .with_var("HOME", &home)
             .without_var("BASH_COMPLETION_VERSINFO")
             .with_existing_path("/usr/share/bash-completion/bash_completion")
             .without_real_path_lookups();
-        let status = loader_status(&env, &home.join(".bashrc")).expect("status should resolve");
+        let status = loader_status(&env).expect("status should resolve");
 
-        assert_eq!(status, LoaderStatus::WiredInBashrc);
+        assert_eq!(
+            status,
+            LoaderStatus::WiredInStartup(home.join(".bash_profile"))
+        );
+    }
+
+    #[test]
+    fn loader_status_is_wired_when_profile_d_script_sources_known_loader() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents(
+                "/etc/profile",
+                "for i in /etc/profile.d/*.sh; do\n  [ -r \"$i\" ] && . \"$i\"\ndone\n",
+            )
+            .with_dir_entries(
+                "/etc/profile.d",
+                [PathBuf::from("/etc/profile.d/bash-completion.sh")],
+            )
+            .with_file_contents(
+                "/etc/profile.d/bash-completion.sh",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(
+            status,
+            LoaderStatus::WiredInStartup(PathBuf::from("/etc/profile.d/bash-completion.sh"))
+        );
+    }
+
+    #[test]
+    fn loader_status_does_not_assume_profile_d_is_reachable_without_startup_wiring() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_dir_entries(
+                "/etc/profile.d",
+                [PathBuf::from("/etc/profile.d/bash-completion.sh")],
+            )
+            .with_file_contents(
+                "/etc/profile.d/bash-completion.sh",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::PresentButUnwired);
+    }
+
+    #[test]
+    fn loader_status_does_not_treat_unrelated_profile_d_source_as_loader_wiring() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents("/etc/profile", "source /etc/profile.d/other.sh\n")
+            .with_dir_entries(
+                "/etc/profile.d",
+                [
+                    PathBuf::from("/etc/profile.d/bash-completion.sh"),
+                    PathBuf::from("/etc/profile.d/other.sh"),
+                ],
+            )
+            .with_file_contents(
+                "/etc/profile.d/bash-completion.sh",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .with_file_contents("/etc/profile.d/other.sh", "echo unrelated\n")
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::PresentButUnwired);
+    }
+
+    #[test]
+    fn loader_status_is_wired_when_profile_directly_sources_non_sh_profile_d_script() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents("/etc/profile", "source /etc/profile.d/bash_completion\n")
+            .with_file_contents(
+                "/etc/profile.d/bash_completion",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(
+            status,
+            LoaderStatus::WiredInStartup(PathBuf::from("/etc/profile.d/bash_completion"))
+        );
+    }
+
+    #[test]
+    fn loader_status_is_wired_when_run_parts_loads_non_dotted_script() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents("/etc/profile", "run-parts /etc/profile.d\n")
+            .with_dir_entries(
+                "/etc/profile.d",
+                [PathBuf::from("/etc/profile.d/bash_completion")],
+            )
+            .with_file_contents(
+                "/etc/profile.d/bash_completion",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(
+            status,
+            LoaderStatus::WiredInStartup(PathBuf::from("/etc/profile.d/bash_completion"))
+        );
+    }
+
+    #[test]
+    fn loader_status_respects_login_file_precedence() {
+        let temp_root = crate::tests::temp_dir("bash-loader-login-precedence");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(
+            home.join(".bash_profile"),
+            "export PATH=\"$HOME/bin:$PATH\"\n",
+        )
+        .expect(".bash_profile should be writable");
+        fs::write(
+            home.join(".bash_login"),
+            "source /usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".bash_login should be writable");
+        fs::write(
+            home.join(".profile"),
+            "source /usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".profile should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::PresentButUnwired);
     }
 
     #[test]
@@ -405,10 +732,10 @@ mod tests {
         let home = temp_root.join("home");
         fs::create_dir_all(&home).expect("home should be creatable");
         fs::write(
-            home.join(".bashrc"),
+            home.join(".profile"),
             "# source /usr/share/bash-completion/bash_completion\nBASH_LOADER=/usr/share/bash-completion/bash_completion\necho \"source /usr/share/bash-completion/bash_completion\"\n",
         )
-        .expect(".bashrc should be writable");
+        .expect(".profile should be writable");
 
         let env = Environment::test()
             .with_var("HOME", &home)
@@ -416,7 +743,7 @@ mod tests {
             .with_existing_path("/usr/share/bash-completion/bash_completion")
             .without_real_path_lookups();
 
-        let status = loader_status(&env, &home.join(".bashrc")).expect("status should resolve");
+        let status = loader_status(&env).expect("status should resolve");
 
         assert_eq!(status, LoaderStatus::PresentButUnwired);
     }
@@ -548,10 +875,10 @@ mod tests {
         fs::write(&completion_path, "complete -F _tool tool\n")
             .expect("completion file should be writable");
         fs::write(
-            home.join(".bashrc"),
+            home.join(".profile"),
             "source /usr/share/bash-completion/bash_completion\n",
         )
-        .expect(".bashrc should be writable");
+        .expect(".profile should be writable");
 
         let env = Environment::test()
             .with_var("HOME", &home)
@@ -563,7 +890,37 @@ mod tests {
 
         assert_eq!(report.mode, ActivationMode::SystemLoader);
         assert_eq!(report.availability, Availability::AvailableAfterNewShell);
-        assert_eq!(report.location, Some(home.join(".bashrc")));
+        assert_eq!(report.location, Some(home.join(".profile")));
+    }
+
+    #[test]
+    fn detect_reports_corruption_when_duplicate_managed_block_is_malformed() {
+        let temp_root = crate::tests::temp_dir("bash-detect-corrupt-duplicate");
+        let home = temp_root.join("home");
+        let completion_path = home.join(".local/share/bash-completion/completions/tool");
+        fs::create_dir_all(
+            completion_path
+                .parent()
+                .expect("completion path should have a parent"),
+        )
+        .expect("completion dir should be creatable");
+        fs::write(&completion_path, "complete -F _tool tool\n")
+            .expect("completion file should be writable");
+        fs::write(
+            home.join(".bashrc"),
+            "# >>> shellcomp bash tool >>>\nif [ -f '/tmp/tool' ]; then\n  . '/tmp/tool'\nfi\n# <<< shellcomp bash tool <<<\n# >>> shellcomp bash tool >>>\n. '/tmp/other'\n",
+        )
+        .expect(".bashrc should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .without_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+
+        let error = detect(&env, "tool", &completion_path).expect_err("detect should fail");
+
+        assert!(matches!(error, crate::Error::ManagedBlockMissingEnd { .. }));
     }
 
     #[test]

@@ -12,8 +12,10 @@ that is predictable, idempotent, and structured for callers.
 - Managed `~/.bashrc` fallback wiring when Bash has no system loader
 - Managed `~/.zshrc` wiring for `fpath` and `compinit`
 - Native Fish completion directory installs
-- Structured manual activation guidance for PowerShell and Elvish
+- Managed PowerShell profile wiring
+- Managed Elvish `rc.elv` wiring
 - Symmetric uninstall cleanup
+- Legacy managed-block migration helpers
 - Structured reports that callers can render however they want
 
 ## Supported Shells
@@ -119,7 +121,7 @@ fn remove_fish_completion() -> shellcomp::Result<()> {
 
 When `path_override` is set, `install` keeps the legacy behavior for non-default custom paths and
 reports `ActivationMode::Manual`. If the override is exactly the shell's managed default path, the
-default activation semantics still apply. If you want a custom path plus managed Bash/Zsh
+default activation semantics still apply. If you want a custom path plus managed Bash/Zsh/PowerShell/Elvish
 activation, use `install_with_policy(..., ActivationPolicy::AutoManaged)`.
 
 ```rust
@@ -136,6 +138,30 @@ fn install_to_custom_path(script: &[u8]) -> shellcomp::Result<()> {
     })?;
 
     assert_eq!(report.activation.mode, shellcomp::ActivationMode::Manual);
+    Ok(())
+}
+```
+
+## Legacy Block Migration
+
+If your CLI previously shipped its own managed markers, rewrite them into `shellcomp` markers
+before or during migration:
+
+```rust
+use shellcomp::{LegacyManagedBlock, MigrateManagedBlocksRequest, Shell, migrate_managed_blocks};
+
+fn migrate_old_bash_block() -> shellcomp::Result<()> {
+    let report = migrate_managed_blocks(MigrateManagedBlocksRequest {
+        shell: Shell::Bash,
+        program_name: "my-cli",
+        path_override: None,
+        legacy_blocks: vec![LegacyManagedBlock {
+            start_marker: "# >>> my-cli completion >>>".to_owned(),
+            end_marker: "# <<< my-cli completion <<<".to_owned(),
+        }],
+    })?;
+
+    println!("{report:#?}");
     Ok(())
 }
 ```

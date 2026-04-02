@@ -6,8 +6,10 @@ use crate::infra::{
     fs,
     managed_block::{self, ManagedBlock},
 };
-use crate::model::{ActivationMode, ActivationReport, Availability, CleanupReport};
-use crate::shell::{ActivationOutcome, CleanupOutcome};
+use crate::model::{
+    ActivationMode, ActivationReport, Availability, CleanupReport, LegacyManagedBlock,
+};
+use crate::shell::{ActivationOutcome, CleanupOutcome, MigrationOutcome, migrate_profile_blocks};
 
 pub(crate) fn install(
     env: &Environment,
@@ -110,6 +112,24 @@ pub(crate) fn detect(
             "Re-run installation or add the completion directory to `fpath` and run `compinit -i`."
                 .to_owned()
         }),
+    })
+}
+
+pub(crate) fn migrate(
+    env: &Environment,
+    program_name: &str,
+    target_path: &Path,
+    legacy_blocks: &[LegacyManagedBlock],
+) -> Result<MigrationOutcome> {
+    let rc_path = zshrc_path(env)?;
+    let block = managed_block(program_name, target_path)?;
+    let (legacy_change, managed_change) = migrate_profile_blocks(&rc_path, legacy_blocks, &block)?;
+
+    Ok(MigrationOutcome {
+        location: Some(rc_path.clone()),
+        managed_change,
+        legacy_change,
+        affected_locations: vec![rc_path],
     })
 }
 

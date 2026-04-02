@@ -76,7 +76,9 @@ fn should_use_shell_backend(
             request.path_override.is_none()
                 || target_matches_default(env, &request.shell, request.program_name, target_path)
         }
-        Shell::Powershell | Shell::Elvish => true,
+        Shell::Powershell | Shell::Elvish => {
+            matches!(activation_policy, ActivationPolicy::AutoManaged)
+        }
         Shell::Other(_) => matches!(activation_policy, ActivationPolicy::AutoManaged),
     }
 }
@@ -90,15 +92,21 @@ fn manual_policy_activation(
 ) -> Result<ActivationReport> {
     if target_matches_default(env, &request.shell, request.program_name, target_path) {
         let detected =
-            shell::detect_default(env, &request.shell, request.program_name, target_path).map_err(
-                |error| map_activation_error(&request.shell, target_path, file_change, error),
-            )?;
+            match shell::detect_default(env, &request.shell, request.program_name, target_path) {
+                Ok(report) => Some(report),
+                Err(_) if matches!(activation_policy, ActivationPolicy::Manual) => None,
+                Err(error) => {
+                    return Err(map_activation_error(
+                        &request.shell,
+                        target_path,
+                        file_change,
+                        error,
+                    ));
+                }
+            };
 
-        if detected.availability != Availability::ManualActionRequired
-            || matches!(
-                request.shell,
-                Shell::Fish | Shell::Powershell | Shell::Elvish
-            )
+        if let Some(detected) = detected
+            && detected.availability != Availability::ManualActionRequired
         {
             return Ok(detected);
         }
@@ -340,6 +348,20 @@ fn map_activation_error(
                     || target_path.display().to_string(),
                     |parent| parent.display().to_string()
                 )
+            )),
+        ),
+        Shell::Powershell => (
+            "Could not update the managed PowerShell profile block.".to_owned(),
+            Some(format!(
+                "Dot-source `{}` from a PowerShell profile manually, or use `path_override` and handle activation yourself.",
+                target_path.display()
+            )),
+        ),
+        Shell::Elvish => (
+            "Could not update the managed Elvish rc.elv block.".to_owned(),
+            Some(format!(
+                "Evaluate `{}` from rc.elv manually, or use `path_override` and handle activation yourself.",
+                target_path.display()
             )),
         ),
         _ => return error,
@@ -687,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn install_powershell_default_path_returns_manual_activation() {
+    fn install_powershell_default_path_returns_managed_activation() {
         let temp_root = crate::tests::temp_dir("install-powershell-default");
         let home = temp_root.join("home");
         let env = Environment::test()
@@ -706,10 +728,10 @@ mod tests {
         )
         .expect("install should succeed");
 
-        assert_eq!(report.activation.mode, ActivationMode::Manual);
+        assert_eq!(report.activation.mode, ActivationMode::ManagedRcBlock);
         assert_eq!(
             report.activation.availability,
-            Availability::ManualActionRequired
+            Availability::AvailableAfterNewShell
         );
         assert!(report.activation.next_step.is_some());
     }
@@ -788,6 +810,40 @@ mod tests {
 
         assert_eq!(report.activation.mode, ActivationMode::NativeDirectory);
         assert_eq!(report.activation.availability, Availability::ActiveNow);
+    }
+
+    #[test]
+    fn install_with_manual_policy_ignores_malformed_default_bash_profile() {
+        let temp_root = crate::tests::temp_dir("install-bash-manual-ignores-malformed-profile");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(
+            home.join(".bashrc"),
+            "# >>> shellcomp bash tool >>>\n. '/tmp/tool'\n",
+        )
+        .expect(".bashrc should be writable");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: None,
+            },
+            ActivationPolicy::Manual,
+        )
+        .expect("manual install should ignore malformed managed profile state");
+
+        assert_eq!(report.activation.mode, ActivationMode::Manual);
+        assert_eq!(
+            report.activation.availability,
+            Availability::ManualActionRequired
+        );
     }
 
     #[test]

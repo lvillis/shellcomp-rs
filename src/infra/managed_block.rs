@@ -55,16 +55,59 @@ pub(crate) fn upsert(path: &Path, block: &ManagedBlock) -> Result<FileChange> {
 }
 
 pub(crate) fn remove(path: &Path, block: &ManagedBlock) -> Result<FileChange> {
+    remove_all(path, std::slice::from_ref(block))
+}
+
+pub(crate) fn migrate_blocks(
+    path: &Path,
+    legacy_blocks: &[ManagedBlock],
+    managed_block: &ManagedBlock,
+) -> Result<(FileChange, FileChange)> {
+    let original = read_utf8_file(path)?;
+    let original_contents = original.as_deref().unwrap_or_default();
+    let original_exists = original.is_some();
+
+    let (without_legacy, legacy_change) =
+        rewrite_remove_all(path, original_contents, legacy_blocks)?;
+    let rewritten = rewrite(path, &without_legacy, managed_block, RewriteMode::Upsert)?;
+    let updated = if rewritten.found {
+        rewritten.contents
+    } else {
+        append_block(&without_legacy, managed_block)
+    };
+
+    let managed_change = if without_legacy == updated {
+        FileChange::Unchanged
+    } else if original_exists || rewritten.found {
+        FileChange::Updated
+    } else {
+        FileChange::Created
+    };
+
+    if original.as_deref() != Some(updated.as_str()) {
+        let parent = path.parent().ok_or_else(|| Error::PathHasNoParent {
+            path: path.to_path_buf(),
+        })?;
+        fs::create_dir_all(parent)
+            .map_err(|source| Error::io("create parent directory for", parent, source))?;
+        fs::write(path, updated).map_err(|source| Error::io("write file", path, source))?;
+    }
+
+    Ok((legacy_change, managed_change))
+}
+
+pub(crate) fn remove_all(path: &Path, blocks: &[ManagedBlock]) -> Result<FileChange> {
     let Some(original) = read_utf8_file(path)? else {
         return Ok(FileChange::Absent);
     };
 
-    let rewritten = rewrite(path, &original, block, RewriteMode::Remove)?;
-    if !rewritten.found {
+    let (rewritten_contents, removed_any) = rewrite_remove_all(path, &original, blocks)?;
+
+    if matches!(removed_any, FileChange::Absent) {
         return Ok(FileChange::Absent);
     }
 
-    fs::write(path, rewritten.contents).map_err(|source| Error::io("write file", path, source))?;
+    fs::write(path, rewritten_contents).map_err(|source| Error::io("write file", path, source))?;
     Ok(FileChange::Removed)
 }
 
@@ -74,11 +117,9 @@ pub(crate) fn matches(path: &Path, block: &ManagedBlock) -> Result<bool> {
     };
 
     let expected = block.render();
-    if contents.contains(expected.trim_end()) {
-        return Ok(true);
-    }
-
+    let expected = expected.trim_end_matches(['\n', '\r']);
     let mut cursor = 0;
+    let mut matched = false;
     while let Some(relative_start) = contents[cursor..].find(&block.start_marker) {
         let start = cursor + relative_start;
         let after_start = start + block.start_marker.len();
@@ -89,10 +130,22 @@ pub(crate) fn matches(path: &Path, block: &ManagedBlock) -> Result<bool> {
                 end_marker: block.end_marker.clone(),
             });
         };
-        cursor = after_start + relative_end + block.end_marker.len();
+        let mut end = after_start + relative_end + block.end_marker.len();
+        while let Some(ch) = contents[end..].chars().next() {
+            if ch == '\n' || ch == '\r' {
+                end += ch.len_utf8();
+                continue;
+            }
+            break;
+        }
+        let candidate = contents[start..end].trim_end_matches(['\n', '\r']);
+        if candidate == expected {
+            matched = true;
+        }
+        cursor = end;
     }
 
-    Ok(false)
+    Ok(matched)
 }
 
 fn read_utf8_file(path: &Path) -> Result<Option<String>> {
@@ -105,6 +158,29 @@ fn read_utf8_file(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(Error::io("read file", path, source)),
     }
+}
+
+fn rewrite_remove_all(
+    path: &Path,
+    contents: &str,
+    blocks: &[ManagedBlock],
+) -> Result<(String, FileChange)> {
+    let mut rewritten_contents = contents.to_owned();
+    let mut removed_any = false;
+    for block in blocks {
+        let rewritten = rewrite(path, &rewritten_contents, block, RewriteMode::Remove)?;
+        rewritten_contents = rewritten.contents;
+        removed_any |= rewritten.found;
+    }
+
+    Ok((
+        rewritten_contents,
+        if removed_any {
+            FileChange::Removed
+        } else {
+            FileChange::Absent
+        },
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -182,7 +258,7 @@ fn append_block(existing: &str, block: &ManagedBlock) -> String {
 mod tests {
     use std::fs;
 
-    use super::{ManagedBlock, matches, remove, upsert};
+    use super::{ManagedBlock, matches, migrate_blocks, remove, remove_all, upsert};
     use crate::model::FileChange;
 
     #[test]
@@ -318,5 +394,99 @@ mod tests {
         let error = matches(&profile, &block).expect_err("matches should fail");
 
         assert!(matches!(error, crate::Error::ManagedBlockMissingEnd { .. }));
+    }
+
+    #[test]
+    fn matches_reports_missing_end_marker_even_when_a_valid_duplicate_exists() {
+        let temp_root = crate::tests::temp_dir("managed-block-matches-corrupt-duplicate");
+        let profile = temp_root.join(".shellrc");
+        let block = ManagedBlock {
+            start_marker: "# >>> shellcomp bash tool >>>".to_owned(),
+            end_marker: "# <<< shellcomp bash tool <<<".to_owned(),
+            body: "source '/tmp/tool'".to_owned(),
+        };
+        fs::write(
+            &profile,
+            format!(
+                "{}# >>> shellcomp bash tool >>>\nsource '/tmp/other'\n",
+                block.render()
+            ),
+        )
+        .expect("profile should be writable");
+
+        let error = matches(&profile, &block).expect_err("matches should fail");
+
+        assert!(matches!(error, crate::Error::ManagedBlockMissingEnd { .. }));
+    }
+
+    #[test]
+    fn remove_all_is_atomic_when_later_block_is_malformed() {
+        let temp_root = crate::tests::temp_dir("managed-block-remove-all-atomic");
+        let profile = temp_root.join(".shellrc");
+        let first = ManagedBlock {
+            start_marker: "# >>> legacy one >>>".to_owned(),
+            end_marker: "# <<< legacy one <<<".to_owned(),
+            body: "source '/tmp/one'".to_owned(),
+        };
+        let second = ManagedBlock {
+            start_marker: "# >>> legacy two >>>".to_owned(),
+            end_marker: "# <<< legacy two <<<".to_owned(),
+            body: "source '/tmp/two'".to_owned(),
+        };
+        fs::write(
+            &profile,
+            format!(
+                "{}{}{}\n{}\n",
+                first.render(),
+                second.start_marker,
+                "\nsource '/tmp/two'\n",
+                "echo keep"
+            ),
+        )
+        .expect("profile should be writable");
+
+        let error = remove_all(&profile, &[first.clone(), second.clone()])
+            .expect_err("remove_all should fail");
+
+        assert!(matches!(error, crate::Error::ManagedBlockMissingEnd { .. }));
+
+        let rendered = fs::read_to_string(profile).expect("profile should remain readable");
+        assert!(rendered.contains(&first.start_marker));
+        assert!(rendered.contains(&second.start_marker));
+        assert!(rendered.contains("echo keep"));
+    }
+
+    #[test]
+    fn migrate_blocks_is_atomic_when_managed_block_is_malformed() {
+        let temp_root = crate::tests::temp_dir("managed-block-migrate-atomic");
+        let profile = temp_root.join(".shellrc");
+        let legacy = ManagedBlock {
+            start_marker: "# >>> legacy >>>".to_owned(),
+            end_marker: "# <<< legacy <<<".to_owned(),
+            body: "source '/tmp/legacy'".to_owned(),
+        };
+        let managed = ManagedBlock {
+            start_marker: "# >>> shellcomp bash tool >>>".to_owned(),
+            end_marker: "# <<< shellcomp bash tool <<<".to_owned(),
+            body: "source '/tmp/tool'".to_owned(),
+        };
+        fs::write(
+            &profile,
+            format!(
+                "{}# >>> shellcomp bash tool >>>\nsource '/tmp/bad'\n",
+                legacy.render()
+            ),
+        )
+        .expect("profile should be writable");
+
+        let error = migrate_blocks(&profile, std::slice::from_ref(&legacy), &managed)
+            .expect_err("migration should fail");
+
+        assert!(matches!(error, crate::Error::ManagedBlockMissingEnd { .. }));
+
+        let rendered = fs::read_to_string(profile).expect("profile should remain readable");
+        assert!(rendered.contains(&legacy.start_marker));
+        assert!(rendered.contains("source '/tmp/bad'"));
+        assert!(!rendered.contains("source '/tmp/tool'"));
     }
 }

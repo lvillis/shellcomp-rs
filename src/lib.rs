@@ -39,10 +39,10 @@
 //!   a managed `~/.zshrc` block that updates `fpath` and runs `compinit -i` when needed.
 //! - [`Shell::Fish`]: writes directly into Fish's native completions directory and does not manage
 //!   a shell startup file.
-//! - [`Shell::Powershell`]: writes a managed completion script file and returns structured manual
-//!   activation guidance for adding it to a PowerShell profile.
-//! - [`Shell::Elvish`]: writes a managed completion script file and returns structured manual
-//!   activation guidance for evaluating it from `rc.elv`.
+//! - [`Shell::Powershell`]: writes a managed completion script file and maintains a managed
+//!   `CurrentUserAllHosts` profile block.
+//! - [`Shell::Elvish`]: writes a managed completion script file and maintains a managed `rc.elv`
+//!   block.
 //!
 //! # Public API
 //!
@@ -55,6 +55,8 @@
 //! - [`detect_activation_at_path`] inspects activation for an explicit completion file path.
 //! - [`uninstall`] removes the managed file and returns a [`RemoveReport`].
 //! - [`uninstall_with_policy`] lets callers control whether activation cleanup should be managed.
+//! - [`migrate_managed_blocks`] removes known legacy markers and rewrites the equivalent
+//!   `shellcomp`-managed startup block.
 //! - [`render_clap_completion`] is available behind the `clap` feature for users who want the
 //!   crate to render completion bytes from `clap::CommandFactory`.
 //!
@@ -182,11 +184,12 @@ mod tests;
 pub use api::render_clap_completion;
 pub use api::{
     default_install_path, detect_activation, detect_activation_at_path, install,
-    install_with_policy, uninstall, uninstall_with_policy,
+    install_with_policy, migrate_managed_blocks, uninstall, uninstall_with_policy,
 };
 pub use error::{Error, Result};
 pub use model::{
     ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
-    FailureReport, FileChange, InstallReport, InstallRequest, Operation, RemoveReport, Shell,
+    FailureReport, FileChange, InstallReport, InstallRequest, LegacyManagedBlock,
+    MigrateManagedBlocksReport, MigrateManagedBlocksRequest, Operation, RemoveReport, Shell,
     UninstallRequest,
 };

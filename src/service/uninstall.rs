@@ -86,7 +86,9 @@ fn should_use_shell_backend(
             request.path_override.is_none()
                 || target_matches_default(env, &request.shell, request.program_name, target_path)
         }
-        crate::Shell::Powershell | crate::Shell::Elvish => true,
+        crate::Shell::Powershell | crate::Shell::Elvish => {
+            matches!(activation_policy, ActivationPolicy::AutoManaged)
+        }
         crate::Shell::Other(_) => matches!(activation_policy, ActivationPolicy::AutoManaged),
     }
 }

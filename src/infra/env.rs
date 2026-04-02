@@ -8,6 +8,8 @@ use crate::error::{Error, Result};
 pub(crate) struct Environment {
     overrides: BTreeMap<String, Option<OsString>>,
     path_overrides: BTreeMap<PathBuf, bool>,
+    file_overrides: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    dir_entries_overrides: BTreeMap<PathBuf, Vec<PathBuf>>,
     use_real_path_lookups: bool,
 }
 
@@ -16,6 +18,8 @@ impl Default for Environment {
         Self {
             overrides: BTreeMap::new(),
             path_overrides: BTreeMap::new(),
+            file_overrides: BTreeMap::new(),
+            dir_entries_overrides: BTreeMap::new(),
             use_real_path_lookups: true,
         }
     }
@@ -51,6 +55,12 @@ impl Environment {
     }
 
     pub(crate) fn path_exists(&self, path: &Path) -> bool {
+        if let Some(contents) = self.file_overrides.get(path) {
+            return contents.is_some();
+        }
+        if self.dir_entries_overrides.contains_key(path) {
+            return true;
+        }
         if let Some(exists) = self.path_overrides.get(path) {
             return *exists;
         }
@@ -70,9 +80,81 @@ impl Environment {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_file_contents(
+        mut self,
+        path: impl Into<PathBuf>,
+        contents: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.file_overrides
+            .insert(path.into(), Some(contents.into()));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_dir_entries(
+        mut self,
+        path: impl Into<PathBuf>,
+        entries: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        self.dir_entries_overrides
+            .insert(path.into(), entries.into_iter().collect());
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn without_real_path_lookups(mut self) -> Self {
         self.use_real_path_lookups = false;
         self
+    }
+
+    pub(crate) fn read_file_if_exists(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        if let Some(contents) = self.file_overrides.get(path) {
+            return Ok(contents.clone());
+        }
+
+        if !self.use_real_path_lookups && !self.is_user_scoped_path(path) {
+            return Ok(None);
+        }
+
+        match std::fs::read(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::io("read file", path, source)),
+        }
+    }
+
+    pub(crate) fn read_dir_entries(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        if let Some(entries) = self.dir_entries_overrides.get(path) {
+            return Ok(entries.clone());
+        }
+
+        if !self.use_real_path_lookups && !self.is_user_scoped_path(path) {
+            return Ok(Vec::new());
+        }
+
+        match std::fs::read_dir(path) {
+            Ok(entries) => entries
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.path())
+                        .map_err(|source| Error::io("read directory", path, source))
+                })
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(source) => Err(Error::io("read directory", path, source)),
+        }
+    }
+
+    fn is_user_scoped_path(&self, path: &Path) -> bool {
+        [
+            self.var_os("HOME").map(PathBuf::from),
+            self.var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            self.var_os("XDG_DATA_HOME").map(PathBuf::from),
+            self.var_os("ZDOTDIR").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|root| path.starts_with(root))
     }
 
     pub(crate) fn home_dir(&self) -> Result<PathBuf> {
