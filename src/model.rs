@@ -4,8 +4,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Supported shells for completion installation and detection.
 ///
-/// Bash, Zsh, and Fish are the current production support set. Other variants remain available so
-/// callers can branch on a stable API surface while unsupported shells return structured errors.
+/// Bash, Zsh, Fish, PowerShell, and Elvish are currently supported. [`Shell::Other`] remains the
+/// explicit escape hatch for unsupported shells.
 pub enum Shell {
     /// GNU Bash.
     Bash,
@@ -13,9 +13,9 @@ pub enum Shell {
     Zsh,
     /// Fish shell.
     Fish,
-    /// Reserved for future implementation.
+    /// Elvish shell.
     Elvish,
-    /// Reserved for future implementation.
+    /// PowerShell.
     Powershell,
     /// An escape hatch for shells not modelled explicitly yet.
     ///
@@ -68,6 +68,23 @@ pub enum ActivationMode {
     /// Activation relies on the shell's native completion directory.
     NativeDirectory,
     /// Activation must be wired manually by the caller or user.
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether `shellcomp` should try to manage activation wiring automatically.
+///
+/// This policy matters most when installing to a custom path. Legacy [`InstallRequest`] behavior
+/// remains unchanged: custom paths default to [`ActivationPolicy::Manual`], while managed default
+/// locations default to [`ActivationPolicy::AutoManaged`].
+pub enum ActivationPolicy {
+    /// Let `shellcomp` apply the shell's managed activation behavior when supported.
+    ///
+    /// For Bash and Zsh this may update startup files. For Fish, PowerShell, and Elvish the best
+    /// available automatic behavior may still be a manual activation report if no safe managed
+    /// wiring exists.
+    AutoManaged,
+    /// Write or remove the completion file without attempting managed activation wiring.
     Manual,
 }
 
@@ -133,7 +150,8 @@ pub enum FailureKind {
 /// Input for a completion install operation.
 ///
 /// Use [`path_override`](InstallRequest::path_override) when you want to control the destination
-/// explicitly and handle shell activation yourself.
+/// explicitly. Non-default custom paths normally require caller-managed activation unless you opt
+/// into [`crate::install_with_policy`] with [`ActivationPolicy::AutoManaged`].
 pub struct InstallRequest<'a> {
     /// Target shell.
     pub shell: Shell,
@@ -144,18 +162,19 @@ pub struct InstallRequest<'a> {
     pub program_name: &'a str,
     /// Completion script bytes to install.
     pub script: &'a [u8],
-    /// Optional custom install path. When set, activation is reported as manual.
+    /// Optional explicit install path instead of the managed default path.
     ///
-    /// `shellcomp` will still write the file idempotently, but it will not attempt to manage shell
-    /// startup wiring for a custom location.
+    /// Legacy [`crate::install`] behavior treats non-default custom paths as manual activation.
+    /// When this path exactly matches the shell's managed default location, the usual managed or
+    /// native activation semantics are preserved instead.
     pub path_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Input for a completion uninstall operation.
 ///
-/// Passing [`path_override`](UninstallRequest::path_override) removes only that explicit file and
-/// skips managed shell profile cleanup.
+/// Passing [`path_override`](UninstallRequest::path_override) removes that explicit file instead
+/// of resolving the default managed path.
 pub struct UninstallRequest<'a> {
     /// Target shell.
     pub shell: Shell,
@@ -165,8 +184,9 @@ pub struct UninstallRequest<'a> {
     pub program_name: &'a str,
     /// Optional custom install path to remove instead of the default managed path.
     ///
-    /// This is mainly useful when a caller previously installed with
-    /// [`InstallRequest::path_override`].
+    /// Legacy [`crate::uninstall`] behavior treats non-default custom paths as manual cleanup.
+    /// When this path exactly matches the shell's managed default location, the usual managed or
+    /// native cleanup semantics are preserved instead.
     pub path_override: Option<PathBuf>,
 }
 

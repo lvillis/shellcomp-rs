@@ -7,11 +7,12 @@ that is predictable, idempotent, and structured for callers.
 
 ## What It Handles
 
-- Default install paths for Bash, Zsh, and Fish
+- Default install paths for Bash, Zsh, Fish, PowerShell, and Elvish
 - `write-if-changed` completion file writes
 - Managed `~/.bashrc` fallback wiring when Bash has no system loader
 - Managed `~/.zshrc` wiring for `fpath` and `compinit`
 - Native Fish completion directory installs
+- Structured manual activation guidance for PowerShell and Elvish
 - Symmetric uninstall cleanup
 - Structured reports that callers can render however they want
 
@@ -20,9 +21,10 @@ that is predictable, idempotent, and structured for callers.
 - Bash
 - Zsh
 - Fish
+- PowerShell
+- Elvish
 
-`Shell::Elvish`, `Shell::Powershell`, and `Shell::Other(_)` are reserved for future expansion and
-currently return `UnsupportedShell`.
+`Shell::Other(_)` remains the explicit unsupported-shell escape hatch.
 
 ## Add The Dependency
 
@@ -115,9 +117,10 @@ fn remove_fish_completion() -> shellcomp::Result<()> {
 
 ## Custom Paths
 
-When `path_override` is set, `shellcomp` writes only to the requested path and reports
-`ActivationMode::Manual`. This keeps the library from guessing additional shell wiring when the
-caller chose a custom location.
+When `path_override` is set, `install` keeps the legacy behavior for non-default custom paths and
+reports `ActivationMode::Manual`. If the override is exactly the shell's managed default path, the
+default activation semantics still apply. If you want a custom path plus managed Bash/Zsh
+activation, use `install_with_policy(..., ActivationPolicy::AutoManaged)`.
 
 ```rust
 use std::path::PathBuf;
@@ -136,3 +139,10 @@ fn install_to_custom_path(script: &[u8]) -> shellcomp::Result<()> {
     Ok(())
 }
 ```
+
+## Examples
+
+- `cargo run --example install_prebuilt`
+- `cargo run --example roundtrip_custom_path`
+- `cargo run --example inspect_managed_paths`
+- `cargo run --example clap_integration --features clap`

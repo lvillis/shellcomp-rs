@@ -16,9 +16,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shell: Shell::Bash,
         program_name: "example-cli",
         script: &script,
-        path_override: Some(demo_path),
+        path_override: Some(demo_path.clone()),
     })?;
 
+    println!("Rendered completion from clap and installed it to a temporary path.");
+    println!("Path: {}", demo_path.display());
     println!("{report:#?}");
     Ok(())
 }

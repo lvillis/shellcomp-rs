@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use shellcomp::{
-    ActivationMode, Availability, Error, FailureKind, FileChange, InstallRequest, Shell,
-    UninstallRequest, default_install_path, install, uninstall,
+    ActivationMode, ActivationPolicy, Availability, Error, FailureKind, FileChange, InstallRequest,
+    Shell, UninstallRequest, default_install_path, detect_activation_at_path, install,
+    install_with_policy, uninstall, uninstall_with_policy,
 };
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -123,6 +124,55 @@ fn default_install_path_rejects_unsupported_shell_via_public_api() {
         error,
         Error::UnsupportedShell(Shell::Other(value)) if value == "xonsh"
     ));
+}
+
+#[test]
+fn install_and_uninstall_with_policy_work_for_custom_fish_paths() {
+    let temp_root = temp_dir("policy-roundtrip");
+    let target = temp_root.join("completions").join("demo.fish");
+
+    let install_report = install_with_policy(
+        InstallRequest {
+            shell: Shell::Fish,
+            program_name: "demo",
+            script: b"complete -c demo -f\n",
+            path_override: Some(target.clone()),
+        },
+        ActivationPolicy::Manual,
+    )
+    .expect("install_with_policy should succeed");
+
+    assert_eq!(install_report.file_change, FileChange::Created);
+    assert_eq!(install_report.activation.mode, ActivationMode::Manual);
+
+    let uninstall_report = uninstall_with_policy(
+        UninstallRequest {
+            shell: Shell::Fish,
+            program_name: "demo",
+            path_override: Some(target.clone()),
+        },
+        ActivationPolicy::Manual,
+    )
+    .expect("uninstall_with_policy should succeed");
+
+    assert_eq!(uninstall_report.file_change, FileChange::Removed);
+    assert_eq!(uninstall_report.cleanup.mode, ActivationMode::Manual);
+    assert!(!target.exists());
+}
+
+#[test]
+fn detect_activation_at_path_reports_status_for_custom_fish_path() {
+    let temp_root = temp_dir("detect-at-path");
+    let target = temp_root.join("completions").join("demo.fish");
+    std::fs::create_dir_all(target.parent().expect("target should have a parent"))
+        .expect("target dir should be creatable");
+    std::fs::write(&target, "complete -c demo -f\n").expect("target file should be writable");
+
+    let report = detect_activation_at_path(Shell::Fish, "demo", &target)
+        .expect("detect_activation_at_path should succeed");
+
+    assert_eq!(report.mode, ActivationMode::Manual);
+    assert_eq!(report.availability, Availability::Unknown);
 }
 
 #[cfg(feature = "clap")]

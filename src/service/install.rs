@@ -3,16 +3,31 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::infra::{env::Environment, fs, paths};
 use crate::model::{
-    ActivationMode, ActivationReport, Availability, FailureKind, FileChange, InstallReport,
-    InstallRequest, Operation, Shell,
+    ActivationMode, ActivationPolicy, ActivationReport, Availability, FailureKind, FileChange,
+    InstallReport, InstallRequest, Operation, Shell,
 };
 use crate::service::{
     FailureContext, FailureStatus, failure, failure_with_status, manual_activation_report,
-    push_unique,
+    push_unique, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
 pub(crate) fn execute(env: &Environment, request: InstallRequest<'_>) -> Result<InstallReport> {
+    let activation_policy = legacy_activation_policy(
+        env,
+        &request.shell,
+        request.program_name,
+        request.path_override.as_deref(),
+    );
+
+    execute_with_policy(env, request, activation_policy)
+}
+
+pub(crate) fn execute_with_policy(
+    env: &Environment,
+    request: InstallRequest<'_>,
+    activation_policy: ActivationPolicy,
+) -> Result<InstallReport> {
     paths::validate_program_name(request.program_name)?;
     let target_path =
         resolve_target_path(env, &request).map_err(|error| map_resolve_error(&request, error))?;
@@ -22,9 +37,7 @@ pub(crate) fn execute(env: &Environment, request: InstallRequest<'_>) -> Result<
     let mut affected_locations = Vec::new();
     push_unique(&mut affected_locations, target_path.clone());
 
-    let activation = if request.path_override.is_some() {
-        manual_activation_report(&request.shell, &target_path)?
-    } else {
+    let activation = if should_use_shell_backend(env, &request, activation_policy, &target_path) {
         let outcome =
             shell::install_default(env, &request.shell, request.program_name, &target_path)
                 .map_err(|error| {
@@ -34,6 +47,8 @@ pub(crate) fn execute(env: &Environment, request: InstallRequest<'_>) -> Result<
             push_unique(&mut affected_locations, path);
         }
         outcome.report
+    } else {
+        manual_policy_activation(env, &request, activation_policy, &target_path, file_change)?
     };
 
     Ok(InstallReport {
@@ -43,6 +58,89 @@ pub(crate) fn execute(env: &Environment, request: InstallRequest<'_>) -> Result<
         activation,
         affected_locations,
     })
+}
+
+fn should_use_shell_backend(
+    env: &Environment,
+    request: &InstallRequest<'_>,
+    activation_policy: ActivationPolicy,
+    target_path: &Path,
+) -> bool {
+    match &request.shell {
+        Shell::Bash => matches!(activation_policy, ActivationPolicy::AutoManaged),
+        Shell::Zsh => {
+            matches!(activation_policy, ActivationPolicy::AutoManaged)
+                && zsh_target_is_autoloadable(request.program_name, target_path)
+        }
+        Shell::Fish => {
+            request.path_override.is_none()
+                || target_matches_default(env, &request.shell, request.program_name, target_path)
+        }
+        Shell::Powershell | Shell::Elvish => true,
+        Shell::Other(_) => matches!(activation_policy, ActivationPolicy::AutoManaged),
+    }
+}
+
+fn manual_policy_activation(
+    env: &Environment,
+    request: &InstallRequest<'_>,
+    activation_policy: ActivationPolicy,
+    target_path: &Path,
+    file_change: FileChange,
+) -> Result<ActivationReport> {
+    if target_matches_default(env, &request.shell, request.program_name, target_path) {
+        let detected =
+            shell::detect_default(env, &request.shell, request.program_name, target_path).map_err(
+                |error| map_activation_error(&request.shell, target_path, file_change, error),
+            )?;
+
+        if detected.availability != Availability::ManualActionRequired
+            || matches!(
+                request.shell,
+                Shell::Fish | Shell::Powershell | Shell::Elvish
+            )
+        {
+            return Ok(detected);
+        }
+    }
+
+    manual_activation_report(
+        &request.shell,
+        request.program_name,
+        target_path,
+        request.path_override.is_some(),
+        activation_policy,
+    )
+    .map_err(|error| map_activation_error(&request.shell, target_path, file_change, error))
+}
+
+fn target_matches_default(
+    env: &Environment,
+    shell: &Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> bool {
+    paths::default_install_path(env, shell, program_name)
+        .map(|default_path| default_path == target_path)
+        .unwrap_or(false)
+}
+
+fn legacy_activation_policy(
+    env: &Environment,
+    shell: &Shell,
+    program_name: &str,
+    path_override: Option<&Path>,
+) -> ActivationPolicy {
+    match path_override {
+        None => ActivationPolicy::AutoManaged,
+        Some(target_path) => {
+            if target_matches_default(env, shell, program_name, target_path) {
+                ActivationPolicy::AutoManaged
+            } else {
+                ActivationPolicy::Manual
+            }
+        }
+    }
 }
 
 fn resolve_target_path(env: &Environment, request: &InstallRequest<'_>) -> Result<PathBuf> {
@@ -173,7 +271,16 @@ fn default_write_next_step(shell: &Shell, has_override: bool) -> String {
                 "Choose a writable path with `path_override`, or place the file into Fish's completions directory manually.".to_owned()
             }
         }
-        _ => "Choose a writable path and activate the completion manually.".to_owned(),
+        Shell::Powershell => {
+            "Choose a writable path, then dot-source the script from a PowerShell profile."
+                .to_owned()
+        }
+        Shell::Elvish => {
+            "Choose a writable path, then evaluate the script from your Elvish rc.elv.".to_owned()
+        }
+        Shell::Other(_) => {
+            "Choose a writable path and activate the completion manually.".to_owned()
+        }
     }
 }
 
@@ -183,6 +290,40 @@ fn map_activation_error(
     file_change: FileChange,
     error: Error,
 ) -> Error {
+    if let Error::NonUtf8Path { path } = error {
+        return failure_with_status(
+            FailureContext {
+                operation: Operation::Install,
+                shell,
+                target_path: Some(target_path),
+                affected_locations: vec![target_path.to_path_buf(), path],
+                kind: FailureKind::InvalidTargetPath,
+            },
+            FailureStatus {
+                file_change: Some(file_change),
+                activation: Some(ActivationReport {
+                    mode: ActivationMode::Manual,
+                    availability: Availability::ManualActionRequired,
+                    location: Some(target_path.to_path_buf()),
+                    reason: Some(
+                        "The completion file was written, but shellcomp could not represent its path safely in shell activation wiring."
+                            .to_owned(),
+                    ),
+                    next_step: Some(
+                        "Move the completion file to a UTF-8 path and run install again so shellcomp can manage activation safely."
+                            .to_owned(),
+                    ),
+                }),
+                cleanup: None,
+            },
+            "The completion file was written, but shellcomp could not represent its path safely in shell activation wiring.",
+            Some(
+                "Move the completion file to a UTF-8 path and run install again so shellcomp can manage activation safely."
+                    .to_owned(),
+            ),
+        );
+    }
+
     let (reason, next_step) = match shell {
         Shell::Bash => (
             "Could not update the managed Bash startup block.".to_owned(),
@@ -272,10 +413,11 @@ fn map_activation_error(
 mod tests {
     use std::fs;
 
-    use super::execute;
+    use super::{execute, execute_with_policy};
     use crate::infra::env::Environment;
     use crate::model::{
-        ActivationMode, Availability, FileChange, InstallRequest, Operation, Shell,
+        ActivationMode, ActivationPolicy, Availability, FileChange, InstallRequest, Operation,
+        Shell,
     };
 
     #[test]
@@ -511,5 +653,284 @@ mod tests {
 
         assert_eq!(first.file_change, FileChange::Created);
         assert_eq!(second.file_change, FileChange::Unchanged);
+    }
+
+    #[test]
+    fn install_with_custom_path_can_opt_into_managed_bash_activation() {
+        let temp_root = crate::tests::temp_dir("install-custom-bash-managed");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.bash");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: Some(target.clone()),
+            },
+            ActivationPolicy::AutoManaged,
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::ManagedRcBlock);
+        assert_eq!(
+            report.activation.availability,
+            Availability::AvailableAfterSource
+        );
+        let bashrc = fs::read_to_string(home.join(".bashrc")).expect(".bashrc should exist");
+        assert!(bashrc.contains(&target.display().to_string()));
+    }
+
+    #[test]
+    fn install_powershell_default_path_returns_manual_activation() {
+        let temp_root = crate::tests::temp_dir("install-powershell-default");
+        let home = temp_root.join("home");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Powershell,
+                program_name: "tool",
+                script: b"# powershell completion\n",
+                path_override: None,
+            },
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::Manual);
+        assert_eq!(
+            report.activation.availability,
+            Availability::ManualActionRequired
+        );
+        assert!(report.activation.next_step.is_some());
+    }
+
+    #[test]
+    fn install_with_custom_powershell_path_quotes_next_step_safely() {
+        let temp_root = crate::tests::temp_dir("install-powershell-quoted-path");
+        let target = temp_root.join("demo's-tool.ps1");
+        let env = Environment::test();
+
+        let report = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Powershell,
+                program_name: "tool",
+                script: b"# powershell completion\n",
+                path_override: Some(target),
+            },
+        )
+        .expect("install should succeed");
+
+        assert!(
+            report
+                .activation
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains("demo''s-tool.ps1"))
+        );
+    }
+
+    #[test]
+    fn install_with_custom_fish_path_does_not_report_native_activation() {
+        let temp_root = crate::tests::temp_dir("install-custom-fish-manual");
+        let target = temp_root.join("custom").join("tool.fish");
+        let env = Environment::test();
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Fish,
+                program_name: "tool",
+                script: b"complete -c tool -f\n",
+                path_override: Some(target),
+            },
+            ActivationPolicy::AutoManaged,
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::Manual);
+        assert_eq!(
+            report.activation.availability,
+            Availability::ManualActionRequired
+        );
+    }
+
+    #[test]
+    fn install_with_manual_policy_keeps_default_fish_path_native() {
+        let temp_root = crate::tests::temp_dir("install-default-fish-manual-policy");
+        let home = temp_root.join("home");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Fish,
+                program_name: "tool",
+                script: b"complete -c tool -f\n",
+                path_override: None,
+            },
+            ActivationPolicy::Manual,
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::NativeDirectory);
+        assert_eq!(report.activation.availability, Availability::ActiveNow);
+    }
+
+    #[test]
+    fn install_with_explicit_default_fish_path_can_still_report_native_activation() {
+        let temp_root = crate::tests::temp_dir("install-explicit-default-fish-path");
+        let home = temp_root.join("home");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+        let target = home.join(".config/fish/completions/tool.fish");
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Fish,
+                program_name: "tool",
+                script: b"complete -c tool -f\n",
+                path_override: Some(target),
+            },
+            ActivationPolicy::AutoManaged,
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::NativeDirectory);
+        assert_eq!(report.activation.availability, Availability::ActiveNow);
+    }
+
+    #[test]
+    fn legacy_install_with_explicit_default_fish_path_reports_native_activation() {
+        let temp_root = crate::tests::temp_dir("install-legacy-explicit-default-fish-path");
+        let home = temp_root.join("home");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+        let target = home.join(".config/fish/completions/tool.fish");
+
+        let report = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Fish,
+                program_name: "tool",
+                script: b"complete -c tool -f\n",
+                path_override: Some(target),
+            },
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::NativeDirectory);
+        assert_eq!(report.activation.availability, Availability::ActiveNow);
+    }
+
+    #[test]
+    fn install_with_non_autoloadable_zsh_target_falls_back_to_manual() {
+        let temp_root = crate::tests::temp_dir("install-custom-zsh-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.zsh");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("ZDOTDIR")
+            .without_real_path_lookups();
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Zsh,
+                program_name: "tool",
+                script: b"#compdef tool\n",
+                path_override: Some(target),
+            },
+            ActivationPolicy::AutoManaged,
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::Manual);
+        assert_eq!(
+            report.activation.availability,
+            Availability::ManualActionRequired
+        );
+    }
+
+    #[test]
+    fn install_with_custom_bash_path_does_not_use_system_loader() {
+        let temp_root = crate::tests::temp_dir("install-custom-bash-direct-source");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.bash");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .with_var("BASH_COMPLETION_VERSINFO", "2")
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: Some(target.clone()),
+            },
+            ActivationPolicy::AutoManaged,
+        )
+        .expect("install should succeed");
+
+        assert_eq!(report.activation.mode, ActivationMode::ManagedRcBlock);
+        assert_eq!(
+            report.activation.availability,
+            Availability::AvailableAfterSource
+        );
+        let bashrc = fs::read_to_string(home.join(".bashrc")).expect(".bashrc should exist");
+        assert!(bashrc.contains(&target.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_reports_structured_failure_when_non_utf8_path_breaks_activation() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_root = crate::tests::temp_dir("install-non-utf8-path");
+        let target = temp_root.join(OsString::from_vec(b"tool-\xff.bash".to_vec()));
+        let env = Environment::test();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: Some(target.clone()),
+            },
+        )
+        .expect_err("install should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+                assert_eq!(report.file_change, Some(FileChange::Created));
+                assert_eq!(report.target_path, Some(target));
+                assert!(report.next_step.is_some());
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 }

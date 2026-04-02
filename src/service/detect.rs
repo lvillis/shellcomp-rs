@@ -1,7 +1,13 @@
+use std::path::Path;
+
 use crate::error::Result;
-use crate::infra::{env::Environment, paths};
-use crate::model::{ActivationReport, FailureKind, Operation, Shell};
-use crate::service::{FailureContext, failure};
+use crate::infra::{env::Environment, fs, paths};
+use crate::model::{
+    ActivationPolicy, ActivationReport, Availability, FailureKind, Operation, Shell,
+};
+use crate::service::{
+    FailureContext, failure, manual_activation_report, zsh_target_is_autoloadable,
+};
 use crate::{Error, shell};
 
 pub(crate) fn execute(
@@ -14,6 +20,102 @@ pub(crate) fn execute(
         .map_err(|error| map_resolve_error(&shell, error))?;
     shell::detect_default(env, &shell, program_name, &target_path)
         .map_err(|error| map_detect_error(&shell, &target_path, error))
+}
+
+pub(crate) fn execute_at_path(
+    env: &Environment,
+    shell: Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> Result<ActivationReport> {
+    paths::validate_program_name(program_name)?;
+    match shell {
+        Shell::Fish => {
+            if path_matches_default_target(env, &Shell::Fish, program_name, target_path) {
+                shell::detect_default(env, &shell, program_name, target_path)
+                    .map_err(|error| map_detect_error(&shell, target_path, error))
+            } else {
+                manual_custom_detection_report(&shell, program_name, target_path)
+                    .map_err(|error| map_detect_error(&shell, target_path, error))
+            }
+        }
+        Shell::Bash => {
+            let report = shell::detect_default(env, &shell, program_name, target_path)
+                .map_err(|error| map_detect_error(&shell, target_path, error))?;
+
+            if path_matches_default_target(env, &Shell::Bash, program_name, target_path)
+                || report.availability != Availability::ManualActionRequired
+            {
+                Ok(report)
+            } else {
+                manual_custom_detection_report(&shell, program_name, target_path)
+                    .map_err(|error| map_detect_error(&shell, target_path, error))
+            }
+        }
+        Shell::Zsh => {
+            if !zsh_target_is_autoloadable(program_name, target_path) {
+                return manual_custom_detection_report(&shell, program_name, target_path)
+                    .map_err(|error| map_detect_error(&shell, target_path, error));
+            }
+
+            let report = shell::detect_default(env, &shell, program_name, target_path)
+                .map_err(|error| map_detect_error(&shell, target_path, error))?;
+
+            if path_matches_default_target(env, &Shell::Zsh, program_name, target_path)
+                || report.availability != Availability::ManualActionRequired
+            {
+                Ok(report)
+            } else {
+                manual_custom_detection_report(&shell, program_name, target_path)
+                    .map_err(|error| map_detect_error(&shell, target_path, error))
+            }
+        }
+        _ => shell::detect_default(env, &shell, program_name, target_path)
+            .map_err(|error| map_detect_error(&shell, target_path, error)),
+    }
+}
+
+fn path_matches_default_target(
+    env: &Environment,
+    shell: &Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> bool {
+    paths::default_install_path(env, shell, program_name)
+        .map(|default_path| default_path == target_path)
+        .unwrap_or(false)
+}
+
+fn manual_custom_detection_report(
+    shell: &Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> Result<ActivationReport> {
+    let installed = fs::file_exists(target_path);
+    let mut report = manual_activation_report(
+        shell,
+        program_name,
+        target_path,
+        true,
+        ActivationPolicy::Manual,
+    )?;
+    report.availability = if installed {
+        Availability::Unknown
+    } else {
+        Availability::ManualActionRequired
+    };
+    report.reason = Some(if installed {
+        format!(
+            "Completion file `{}` is installed at a custom path, but shellcomp could not confirm managed activation for it.",
+            target_path.display()
+        )
+    } else {
+        format!(
+            "Completion file `{}` is not installed.",
+            target_path.display()
+        )
+    });
+    Ok(report)
 }
 
 fn map_resolve_error(shell: &Shell, error: Error) -> Error {
@@ -82,6 +184,20 @@ fn map_detect_error(shell: &Shell, target_path: &std::path::Path, error: Error) 
                     .to_owned(),
             ),
         ),
+        Error::NonUtf8Path { path } => failure(
+            FailureContext {
+                operation: Operation::DetectActivation,
+                shell,
+                target_path: Some(target_path),
+                affected_locations: vec![target_path.to_path_buf(), path],
+                kind: FailureKind::InvalidTargetPath,
+            },
+            "The requested completion path could not be represented safely as UTF-8 for activation detection.",
+            Some(
+                "Move the completion file to a UTF-8 path or choose a UTF-8 path before asking shellcomp to inspect activation."
+                    .to_owned(),
+            ),
+        ),
         Error::ManagedBlockMissingEnd { path, .. } => failure(
             FailureContext {
                 operation: Operation::DetectActivation,
@@ -107,7 +223,7 @@ fn map_detect_error(shell: &Shell, target_path: &std::path::Path, error: Error) 
 mod tests {
     use std::fs;
 
-    use super::execute;
+    use super::{execute, execute_at_path};
     use crate::infra::env::Environment;
     use crate::model::{ActivationMode, Availability, InstallRequest, Operation, Shell};
     use crate::service::install;
@@ -200,6 +316,74 @@ mod tests {
                         .iter()
                         .any(|path| path.ends_with(".zshrc"))
                 );
+                assert!(report.next_step.is_some());
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn detect_at_path_reports_unknown_for_custom_bash_path_without_managed_wiring() {
+        let temp_root = crate::tests::temp_dir("detect-custom-bash-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.bash");
+        fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("target dir should be creatable");
+        fs::write(&target, "complete -F _tool tool\n").expect("target should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Bash, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::Unknown);
+    }
+
+    #[test]
+    fn detect_at_path_reports_manual_for_non_autoloadable_zsh_target() {
+        let temp_root = crate::tests::temp_dir("detect-custom-zsh-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.zsh");
+        fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("target dir should be creatable");
+        fs::write(&target, "#compdef tool\n").expect("target should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("ZDOTDIR")
+            .without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Zsh, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_at_path_returns_structured_failure_for_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_root = crate::tests::temp_dir("detect-non-utf8-path");
+        let target = temp_root.join(OsString::from_vec(b"tool-\xff.fish".to_vec()));
+        std::fs::write(&target, "complete -c tool -f\n").expect("target should be writable");
+
+        let env = Environment::test().without_real_path_lookups();
+
+        let error = execute_at_path(&env, Shell::Fish, "tool", &target)
+            .expect_err("detect should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.operation, Operation::DetectActivation);
+                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+                assert_eq!(report.target_path, Some(target));
                 assert!(report.next_step.is_some());
             }
             other => panic!("unexpected error variant: {other}"),

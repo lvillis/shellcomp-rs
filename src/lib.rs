@@ -26,9 +26,9 @@
 //!
 //! # Supported Shells
 //!
-//! Production support currently covers [`Shell::Bash`], [`Shell::Zsh`], and [`Shell::Fish`].
-//! Other shells remain modelled in the API so callers can branch on a stable type, but unsupported
-//! shells return [`Error::UnsupportedShell`].
+//! Production support currently covers [`Shell::Bash`], [`Shell::Zsh`], [`Shell::Fish`],
+//! [`Shell::Powershell`], and [`Shell::Elvish`]. [`Shell::Other`] remains the explicit escape
+//! hatch for unsupported shells.
 //!
 //! Managed behavior for the supported shells:
 //!
@@ -39,6 +39,10 @@
 //!   a managed `~/.zshrc` block that updates `fpath` and runs `compinit -i` when needed.
 //! - [`Shell::Fish`]: writes directly into Fish's native completions directory and does not manage
 //!   a shell startup file.
+//! - [`Shell::Powershell`]: writes a managed completion script file and returns structured manual
+//!   activation guidance for adding it to a PowerShell profile.
+//! - [`Shell::Elvish`]: writes a managed completion script file and returns structured manual
+//!   activation guidance for evaluating it from `rc.elv`.
 //!
 //! # Public API
 //!
@@ -46,8 +50,11 @@
 //!
 //! - [`default_install_path`] resolves the managed target path for a shell and binary name.
 //! - [`install`] writes the completion file and returns an [`InstallReport`].
+//! - [`install_with_policy`] lets callers opt into or out of managed activation explicitly.
 //! - [`detect_activation`] inspects the managed setup and returns an [`ActivationReport`].
+//! - [`detect_activation_at_path`] inspects activation for an explicit completion file path.
 //! - [`uninstall`] removes the managed file and returns a [`RemoveReport`].
+//! - [`uninstall_with_policy`] lets callers control whether activation cleanup should be managed.
 //! - [`render_clap_completion`] is available behind the `clap` feature for users who want the
 //!   crate to render completion bytes from `clap::CommandFactory`.
 //!
@@ -60,6 +67,8 @@
 //! - [`ActivationReport::mode`] tells you *how* the shell will load the completion.
 //! - [`ActivationReport::availability`] tells you whether it is active now, available after a new
 //!   shell, available after sourcing a file, or still requires manual work.
+//! - [`ActivationPolicy`] lets callers choose whether installation to a custom path should still
+//!   attempt managed shell wiring when the shell supports it.
 //! - [`RemoveReport::cleanup`] separates startup wiring cleanup from completion file removal so a
 //!   caller can preserve partial progress.
 //! - [`FailureReport`] carries structured failure kind, relevant paths, and suggested next steps.
@@ -92,8 +101,9 @@
 //!
 //! # Custom Path Example
 //!
-//! Passing [`InstallRequest::path_override`] tells `shellcomp` to skip startup wiring and report
-//! manual activation explicitly.
+//! Passing [`InstallRequest::path_override`] usually tells `shellcomp` to skip startup wiring and
+//! report manual activation explicitly. The one exception is an override that exactly matches the
+//! shell's managed default path, which still keeps the default activation semantics.
 //!
 //! ```no_run
 //! use std::path::PathBuf;
@@ -170,9 +180,13 @@ mod tests;
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub use api::render_clap_completion;
-pub use api::{default_install_path, detect_activation, install, uninstall};
+pub use api::{
+    default_install_path, detect_activation, detect_activation_at_path, install,
+    install_with_policy, uninstall, uninstall_with_policy,
+};
 pub use error::{Error, Result};
 pub use model::{
-    ActivationMode, ActivationReport, Availability, CleanupReport, FailureKind, FailureReport,
-    FileChange, InstallReport, InstallRequest, Operation, RemoveReport, Shell, UninstallRequest,
+    ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
+    FailureReport, FileChange, InstallReport, InstallRequest, Operation, RemoveReport, Shell,
+    UninstallRequest,
 };

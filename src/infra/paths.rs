@@ -44,6 +44,17 @@ pub(crate) fn default_install_path(
             .join("fish")
             .join("completions")
             .join(format!("{program_name}.fish"))),
+        Shell::Powershell => Ok(env
+            .xdg_data_home()?
+            .join("powershell")
+            .join("completions")
+            .join(format!("{program_name}.ps1"))),
+        Shell::Elvish => Ok(env
+            .xdg_config_home()?
+            .join("elvish")
+            .join("lib")
+            .join("shellcomp")
+            .join(format!("{program_name}.elv"))),
         unsupported => Err(Error::UnsupportedShell(unsupported.clone())),
     }
 }
@@ -74,6 +85,15 @@ mod tests {
             default_install_path(&env, &Shell::Fish, "tool").expect("fish path should resolve"),
             std::path::PathBuf::from("/tmp/home/.config/fish/completions/tool.fish")
         );
+        assert_eq!(
+            default_install_path(&env, &Shell::Powershell, "tool")
+                .expect("powershell path should resolve"),
+            std::path::PathBuf::from("/tmp/home/.local/share/powershell/completions/tool.ps1")
+        );
+        assert_eq!(
+            default_install_path(&env, &Shell::Elvish, "tool").expect("elvish path should resolve"),
+            std::path::PathBuf::from("/tmp/home/.config/elvish/lib/shellcomp/tool.elv")
+        );
     }
 
     #[test]
@@ -95,6 +115,15 @@ mod tests {
         assert_eq!(
             default_install_path(&env, &Shell::Fish, "tool").expect("fish path should resolve"),
             std::path::PathBuf::from("/tmp/config/fish/completions/tool.fish")
+        );
+        assert_eq!(
+            default_install_path(&env, &Shell::Powershell, "tool")
+                .expect("powershell path should resolve"),
+            std::path::PathBuf::from("/tmp/data/powershell/completions/tool.ps1")
+        );
+        assert_eq!(
+            default_install_path(&env, &Shell::Elvish, "tool").expect("elvish path should resolve"),
+            std::path::PathBuf::from("/tmp/config/elvish/lib/shellcomp/tool.elv")
         );
     }
 

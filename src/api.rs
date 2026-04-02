@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::infra::{env::Environment, paths};
-use crate::model::{InstallReport, InstallRequest, RemoveReport, Shell, UninstallRequest};
+use crate::model::{
+    ActivationPolicy, InstallReport, InstallRequest, RemoveReport, Shell, UninstallRequest,
+};
 use crate::service::{detect, install, uninstall};
 
 /// Returns the default managed install path for a shell and binary name.
@@ -15,6 +17,8 @@ use crate::service::{detect, install, uninstall};
 /// - Bash: `$XDG_DATA_HOME/bash-completion/completions/<program>`
 /// - Zsh: `$ZDOTDIR/.zfunc/_<program>`
 /// - Fish: `$XDG_CONFIG_HOME/fish/completions/<program>.fish`
+/// - PowerShell: `$XDG_DATA_HOME/powershell/completions/<program>.ps1`
+/// - Elvish: `$XDG_CONFIG_HOME/elvish/lib/shellcomp/<program>.elv`
 ///
 /// # Errors
 ///
@@ -38,7 +42,8 @@ pub fn default_install_path(shell: Shell, program_name: &str) -> Result<PathBuf>
 ///
 /// When `path_override` is `None`, the script is written into the shell's managed default
 /// location and `shellcomp` attempts to wire activation automatically. When `path_override` is
-/// set, the script is written only to that path and activation is reported as manual.
+/// set, legacy behavior is to treat non-default custom paths as manual activation, while an
+/// override equal to the managed default path still keeps the default activation semantics.
 ///
 /// This function is idempotent with respect to the written script contents and managed startup
 /// wiring. Re-installing an identical script normally returns [`crate::FileChange::Unchanged`].
@@ -70,10 +75,43 @@ pub fn install(request: InstallRequest<'_>) -> Result<InstallReport> {
     install::execute(&Environment::system(), request)
 }
 
+/// Installs a completion script with explicit activation intent.
+///
+/// This is the opt-in API for callers that want a custom path but still want `shellcomp` to
+/// manage activation when the shell supports it.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::PathBuf;
+///
+/// use shellcomp::{ActivationPolicy, InstallRequest, Shell, install_with_policy};
+///
+/// let report = install_with_policy(
+///     InstallRequest {
+///         shell: Shell::Bash,
+///         program_name: "demo",
+///         script: b"complete -F _demo demo\n",
+///         path_override: Some(PathBuf::from("/tmp/demo.bash")),
+///     },
+///     ActivationPolicy::AutoManaged,
+/// )?;
+///
+/// println!("{report:#?}");
+/// # Ok::<(), shellcomp::Error>(())
+/// ```
+pub fn install_with_policy(
+    request: InstallRequest<'_>,
+    activation_policy: ActivationPolicy,
+) -> Result<InstallReport> {
+    install::execute_with_policy(&Environment::system(), request, activation_policy)
+}
+
 /// Removes a previously managed completion script and any managed activation wiring.
 ///
-/// When `path_override` is set, only that file path is removed. Managed shell startup cleanup is
-/// skipped because `shellcomp` did not own activation for a custom path.
+/// When `path_override` is set, legacy behavior removes only that file path for non-default custom
+/// targets. If the override is equal to the shell's managed default path, uninstall keeps the
+/// default cleanup semantics for that shell.
 ///
 /// This function is idempotent. Removing an already absent completion file returns
 /// [`crate::FileChange::Absent`] rather than failing.
@@ -101,10 +139,21 @@ pub fn uninstall(request: UninstallRequest<'_>) -> Result<RemoveReport> {
     uninstall::execute(&Environment::system(), request)
 }
 
+/// Removes a completion script with explicit activation cleanup intent.
+///
+/// Use this when the completion file lives at a custom path and you still want `shellcomp` to
+/// clean up managed activation wiring for shells such as Bash or Zsh.
+pub fn uninstall_with_policy(
+    request: UninstallRequest<'_>,
+    activation_policy: ActivationPolicy,
+) -> Result<RemoveReport> {
+    uninstall::execute_with_policy(&Environment::system(), request, activation_policy)
+}
+
 /// Detects how a completion would be activated for the current environment.
 ///
-/// Detection inspects the default managed location for the given shell and binary name. This API
-/// does not accept a custom path because callers can reason about explicit override paths directly.
+/// Detection inspects the default managed location for the given shell and binary name. For custom
+/// paths, use [`detect_activation_at_path`].
 ///
 /// The returned [`crate::ActivationReport`] distinguishes the wiring mechanism
 /// ([`crate::ActivationMode`]) from current readiness ([`crate::Availability`]).
@@ -125,6 +174,19 @@ pub fn uninstall(request: UninstallRequest<'_>) -> Result<RemoveReport> {
 /// ```
 pub fn detect_activation(shell: Shell, program_name: &str) -> Result<crate::ActivationReport> {
     detect::execute(&Environment::system(), shell, program_name)
+}
+
+/// Detects activation state for an explicit completion file path.
+///
+/// This is useful when a caller installed to a custom path and wants detection against that exact
+/// file rather than the shell's managed default location. If the explicit path matches the managed
+/// default path, detection keeps the shell's default activation semantics.
+pub fn detect_activation_at_path(
+    shell: Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> Result<crate::ActivationReport> {
+    detect::execute_at_path(&Environment::system(), shell, program_name, target_path)
 }
 
 #[cfg(feature = "clap")]
