@@ -1,0 +1,44 @@
+[package]
+name = "shellcomp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.94"
+description = "Shell completion installation and activation helpers for Rust CLI tools"
+readme = "README.md"
+keywords = ["cli", "completion", "shell", "bash", "zsh"]
+categories = ["command-line-interface"]
+repository = "https://github.com/lvillis/shellcomp-rs"
+homepage = "https://github.com/lvillis/shellcomp-rs"
+documentation = "https://docs.rs/shellcomp"
+include = [
+  "/Cargo.toml",
+  "/LICENSE",
+  "/README.md",
+  "/src/**",
+  "/tests/**",
+  "/examples/**",
+]
+
+[features]
+default = []
+clap = ["dep:clap", "dep:clap_complete"]
+
+[dependencies]
+clap = { version = "4.6.0", default-features = false, features = ["std", "derive"], optional = true }
+clap_complete = { version = "4.6.0", default-features = false, optional = true }
+
+[[example]]
+name = "clap_integration"
+required-features = ["clap"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.release]
+tag-prefix = ""
+tag-name = "{{prefix}}{{version}}"
+pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
+tag-message = "chore: release {{crate_name}} version {{version}}"
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]

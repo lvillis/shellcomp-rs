@@ -1,0 +1,12 @@
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) fn temp_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("shellcomp-{label}-{unique}"));
+    std::fs::create_dir_all(&path).expect("temp dir should be creatable");
+    path
+}
