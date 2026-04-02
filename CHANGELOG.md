@@ -1,3 +1,13 @@
+## [0.1.4] - 2026-04-02
+
+### 🚀 Features
+
+- Expand completion deployment across custom paths and shells
+## [0.1.3] - 2026-04-02
+
+### ⚙️ Miscellaneous Tasks
+
+- Release shellcomp version 0.1.3
 ## [0.1.2] - 2026-04-02
 
 ### ⚙️ Miscellaneous Tasks
