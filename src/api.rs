@@ -18,7 +18,9 @@ use crate::service::{detect, install, migrate, uninstall};
 /// - Bash: `$XDG_DATA_HOME/bash-completion/completions/<program>`
 /// - Zsh: `$ZDOTDIR/.zfunc/_<program>`
 /// - Fish: `$XDG_CONFIG_HOME/fish/completions/<program>.fish`
-/// - PowerShell: `$XDG_DATA_HOME/powershell/completions/<program>.ps1`
+/// - PowerShell:
+///   - Windows: `%USERPROFILE%\\Documents\\PowerShell\\Completions\\<program>.ps1`
+///   - Non-Windows: `$XDG_DATA_HOME/powershell/completions/<program>.ps1`
 /// - Elvish: `$XDG_CONFIG_HOME/elvish/lib/shellcomp/<program>.elv`
 ///
 /// # Errors
@@ -208,6 +210,7 @@ pub fn migrate_managed_blocks(
 ///
 /// This helper is intentionally optional so the core crate does not require `clap`.
 /// It only renders script bytes; installation and activation are still handled by [`install`].
+/// The `shell` argument accepts either [`crate::Shell`] or [`crate::clap_complete::Shell`].
 ///
 /// # Errors
 ///
@@ -217,7 +220,7 @@ pub fn migrate_managed_blocks(
 ///
 /// ```no_run
 /// use clap::Parser;
-/// use shellcomp::{Shell, render_clap_completion};
+/// use shellcomp::{InstallRequest, install, render_clap_completion};
 ///
 /// #[derive(Parser)]
 /// struct Cli {
@@ -225,28 +228,25 @@ pub fn migrate_managed_blocks(
 ///     verbose: bool,
 /// }
 ///
-/// let script = render_clap_completion::<Cli>(Shell::Bash, "demo")?;
+/// let generator_shell = shellcomp::clap_complete::Shell::Bash;
+/// let script = render_clap_completion::<Cli>(generator_shell, "demo")?;
+/// let report = install(InstallRequest {
+///     shell: generator_shell.into(),
+///     program_name: "demo",
+///     script: &script,
+///     path_override: None,
+/// })?;
+///
 /// assert!(!script.is_empty());
+/// assert_eq!(report.shell, shellcomp::Shell::Bash);
 /// # Ok::<(), shellcomp::Error>(())
 /// ```
 pub fn render_clap_completion<T: clap::CommandFactory>(
-    shell: Shell,
+    shell: impl Into<Shell>,
     bin_name: &str,
 ) -> Result<Vec<u8>> {
-    use clap_complete::{Generator, generate};
-
-    fn map_shell(shell: Shell) -> Result<impl Generator> {
-        match shell {
-            Shell::Bash => Ok(clap_complete::Shell::Bash),
-            Shell::Zsh => Ok(clap_complete::Shell::Zsh),
-            Shell::Fish => Ok(clap_complete::Shell::Fish),
-            Shell::Elvish => Ok(clap_complete::Shell::Elvish),
-            Shell::Powershell => Ok(clap_complete::Shell::PowerShell),
-            Shell::Other(value) => Err(crate::Error::UnsupportedShell(Shell::Other(value))),
-        }
-    }
-
-    let generator = map_shell(shell)?;
+    use clap_complete::generate;
+    let generator = <clap_complete::Shell as TryFrom<Shell>>::try_from(shell.into())?;
     let mut command = T::command();
     let mut output = Vec::new();
     generate(generator, &mut command, bin_name, &mut output);
@@ -273,6 +273,15 @@ mod tests {
         let rendered = String::from_utf8(script).expect("completion output should be utf-8");
         assert!(rendered.contains("test-cli"));
         assert!(rendered.contains("_test-cli"));
+    }
+
+    #[test]
+    fn renders_clap_completion_from_clap_complete_shell() {
+        let script =
+            render_clap_completion::<TestCli>(crate::clap_complete::Shell::Fish, "test-cli")
+                .expect("fish completion should render");
+        let rendered = String::from_utf8(script).expect("completion output should be utf-8");
+        assert!(rendered.contains("test-cli"));
     }
 
     #[test]

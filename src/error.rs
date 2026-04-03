@@ -136,7 +136,7 @@ impl Error {
                 "Program names must use a safe portable character set: ASCII letters, digits, `.`, `_`, and `-`.",
             ),
             Self::MissingHome => Some(
-                "The operation requires HOME because the default shell-managed path could not be resolved.",
+                "The operation requires a user home directory because the default shell-managed path could not be resolved.",
             ),
             Self::UnsupportedShell(_) => Some(
                 "This shell is modelled in the API but not implemented in the production support set yet.",
@@ -177,7 +177,7 @@ impl Error {
         match self {
             Self::Failure(report) => report.next_step.as_deref(),
             Self::MissingHome => Some(
-                "Set HOME for the current process or pass `path_override` so the library does not need a default managed path.",
+                "Set HOME or the relevant shell-specific home variable for the current process, or pass `path_override` so the library does not need a default managed path.",
             ),
             Self::PathHasNoParent { .. } => Some(
                 "Pass a file path with a real parent directory, or create the parent directory before calling shellcomp.",
@@ -200,7 +200,10 @@ impl Display for Error {
                     "program name `{program_name}` contains unsupported characters"
                 )
             }
-            Self::MissingHome => write!(f, "HOME is not set and no fallback path can be resolved"),
+            Self::MissingHome => write!(
+                f,
+                "no supported home-directory environment variable is set and no fallback path can be resolved"
+            ),
             Self::UnsupportedShell(shell) => write!(f, "shell `{shell}` is not supported yet"),
             Self::PathHasNoParent { path } => {
                 write!(
@@ -305,5 +308,27 @@ mod tests {
             )
         );
         assert_eq!(error.location(), None);
+    }
+
+    #[test]
+    fn missing_home_helpers_use_generic_home_directory_guidance() {
+        let error = Error::MissingHome;
+
+        assert_eq!(
+            error.reason(),
+            Some(
+                "The operation requires a user home directory because the default shell-managed path could not be resolved."
+            )
+        );
+        assert_eq!(
+            error.next_step(),
+            Some(
+                "Set HOME or the relevant shell-specific home variable for the current process, or pass `path_override` so the library does not need a default managed path."
+            )
+        );
+        assert_eq!(
+            error.to_string(),
+            "no supported home-directory environment variable is set and no fallback path can be resolved"
+        );
     }
 }

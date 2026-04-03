@@ -59,6 +59,9 @@
 //!   `shellcomp`-managed startup block.
 //! - [`render_clap_completion`] is available behind the `clap` feature for users who want the
 //!   crate to render completion bytes from `clap::CommandFactory`.
+//! - [`clap_complete`] is re-exported behind the `clap` feature so callers can use
+//!   `shellcomp::clap_complete::Shell` without pulling conflicting top-level `Shell` names into
+//!   the same scope manually.
 //!
 //! # Reading Reports
 //!
@@ -98,6 +101,35 @@
 //!
 //! println!("installed to {}", report.target_path.display());
 //! println!("activation: {:?}", report.activation);
+//! # Ok::<(), shellcomp::Error>(())
+//! ```
+//!
+//! # clap Integration Example
+//!
+//! With the `clap` feature enabled, you can keep the generator-facing shell value under
+//! `shellcomp::clap_complete::Shell` and convert it into [`Shell`] only when you call the
+//! deployment API.
+//!
+//! ```no_run
+//! use clap::Parser;
+//! use shellcomp::{InstallRequest, install, render_clap_completion};
+//!
+//! #[derive(Parser)]
+//! struct Cli {
+//!     #[arg(long)]
+//!     verbose: bool,
+//! }
+//!
+//! let generator_shell = shellcomp::clap_complete::Shell::Zsh;
+//! let script = render_clap_completion::<Cli>(generator_shell, "demo")?;
+//! let report = install(InstallRequest {
+//!     shell: generator_shell.into(),
+//!     program_name: "demo",
+//!     script: &script,
+//!     path_override: None,
+//! })?;
+//!
+//! println!("installed to {}", report.target_path.display());
 //! # Ok::<(), shellcomp::Error>(())
 //! ```
 //!
@@ -182,6 +214,15 @@ mod tests;
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub use api::render_clap_completion;
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+/// Re-exported `clap_complete` shell type for callers that want a namespaced integration surface.
+///
+/// This lets downstream code write `shellcomp::clap_complete::Shell` without importing a second
+/// top-level `Shell` symbol.
+pub mod clap_complete {
+    pub use ::clap_complete::Shell;
+}
 pub use api::{
     default_install_path, detect_activation, detect_activation_at_path, install,
     install_with_policy, migrate_managed_blocks, uninstall, uninstall_with_policy,

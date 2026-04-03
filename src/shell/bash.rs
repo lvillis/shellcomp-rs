@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -103,7 +104,7 @@ pub(crate) fn install(
             }),
             next_step: Some(format!(
                 "Run `source {}` or start a new Bash session.",
-                rc_path.display()
+                shell_quote(&rc_path)?
             )),
         },
         affected_locations: vec![rc_path],
@@ -117,14 +118,35 @@ pub(crate) fn uninstall(
 ) -> Result<CleanupOutcome> {
     let rc_path = bashrc_path(env)?;
     let block = managed_block(program_name, target_path)?;
+    let can_use_system_loader = target_uses_system_loader_path(env, program_name, target_path);
+    let loader_status = if can_use_system_loader {
+        Some(loader_status(env)?)
+    } else {
+        None
+    };
     let rc_change = managed_block::remove(&rc_path, &block)?;
 
-    Ok(CleanupOutcome {
-        cleanup: CleanupReport {
-            mode: ActivationMode::ManagedRcBlock,
-            change: rc_change,
-            location: Some(rc_path.clone()),
-            reason: Some(match rc_change {
+    let (mode, location, reason, mut affected_locations) = match (&rc_change, loader_status) {
+        (crate::FileChange::Absent, Some(LoaderStatus::ActiveNow)) => (
+            ActivationMode::SystemLoader,
+            None,
+            "No shellcomp-managed Bash activation block was present; Bash completion relied on an active system loader."
+                .to_owned(),
+            vec![rc_path.clone()],
+        ),
+        (crate::FileChange::Absent, Some(LoaderStatus::WiredInStartup(startup_path))) => (
+            ActivationMode::SystemLoader,
+            Some(startup_path.clone()),
+            format!(
+                "No shellcomp-managed Bash activation block was present; Bash completion was wired through the system loader in `{}`.",
+                startup_path.display()
+            ),
+            vec![rc_path.clone(), startup_path],
+        ),
+        _ => (
+            ActivationMode::ManagedRcBlock,
+            Some(rc_path.clone()),
+            match rc_change {
                 crate::FileChange::Removed => {
                     "Removed the managed Bash activation block from ~/.bashrc.".to_owned()
                 }
@@ -132,10 +154,23 @@ pub(crate) fn uninstall(
                     "No managed Bash activation block was present in ~/.bashrc.".to_owned()
                 }
                 _ => "Bash activation cleanup completed.".to_owned(),
-            }),
+            },
+            vec![rc_path.clone()],
+        ),
+    };
+
+    Ok(CleanupOutcome {
+        cleanup: CleanupReport {
+            mode,
+            change: rc_change,
+            location,
+            reason: Some(reason),
             next_step: None,
         },
-        affected_locations: vec![rc_path],
+        affected_locations: {
+            affected_locations.shrink_to_fit();
+            affected_locations
+        },
     })
 }
 
@@ -151,6 +186,8 @@ pub(crate) fn detect(
     } else {
         None
     };
+    let block = managed_block(program_name, target_path)?;
+    let wired = managed_block::matches(&rc_path, &block)?;
 
     if !fs::file_exists(target_path) {
         let mode = if matches!(
@@ -164,11 +201,22 @@ pub(crate) fn detect(
         return Ok(ActivationReport {
             mode,
             availability: Availability::ManualActionRequired,
-            location: Some(target_path.to_path_buf()),
-            reason: Some(format!(
-                "Completion file `{}` is not installed.",
-                target_path.display()
-            )),
+            location: Some(if matches!(mode, ActivationMode::ManagedRcBlock) && wired {
+                rc_path.clone()
+            } else {
+                target_path.to_path_buf()
+            }),
+            reason: Some(if matches!(mode, ActivationMode::ManagedRcBlock) && wired {
+                format!(
+                    "Managed Bash activation block is present in ~/.bashrc, but completion file `{}` is not installed.",
+                    target_path.display()
+                )
+            } else {
+                format!(
+                    "Completion file `{}` is not installed.",
+                    target_path.display()
+                )
+            }),
             next_step: Some(
                 "Run your CLI's completion install command or install the script manually."
                     .to_owned(),
@@ -208,8 +256,8 @@ pub(crate) fn detect(
         }
     }
 
-    let block = managed_block(program_name, target_path)?;
-    let wired = managed_block::matches(&rc_path, &block)?;
+    let quoted_rc_path = shell_quote(&rc_path)?;
+    let quoted_target_path = shell_quote(target_path)?;
 
     Ok(ActivationReport {
         mode: ActivationMode::ManagedRcBlock,
@@ -226,9 +274,11 @@ pub(crate) fn detect(
                 .to_owned()
         }),
         next_step: Some(if wired {
-            "Run `source ~/.bashrc` or start a new Bash session.".to_owned()
+            format!("Run `source {quoted_rc_path}` or start a new Bash session.")
         } else {
-            "Re-run installation or source the completion file from ~/.bashrc manually.".to_owned()
+            format!(
+                "Re-run installation or source {quoted_target_path} from {quoted_rc_path} manually."
+            )
         }),
     })
 }
@@ -305,12 +355,8 @@ fn loader_file_present(env: &Environment) -> bool {
 
 fn startup_file_wiring(env: &Environment) -> Result<Option<PathBuf>> {
     for startup_path in startup_files(env)? {
-        if startup_file_sources_loader(env, &startup_path)? {
-            return Ok(Some(startup_path));
-        }
-
-        if let Some(profile_script) = startup_file_sources_profile_script(env, &startup_path)? {
-            return Ok(Some(profile_script));
+        if let Some(wired_path) = file_reaches_loader(env, &startup_path, &mut BTreeSet::new())? {
+            return Ok(Some(wired_path));
         }
     }
 
@@ -318,10 +364,7 @@ fn startup_file_wiring(env: &Environment) -> Result<Option<PathBuf>> {
 }
 
 fn startup_files(env: &Environment) -> Result<Vec<PathBuf>> {
-    let mut files = vec![
-        PathBuf::from("/etc/bashrc"),
-        PathBuf::from("/etc/bash.bashrc"),
-    ];
+    let mut files = vec![PathBuf::from("/etc/bash.bashrc")];
     if let Ok(home) = env.home_dir() {
         push_unique_path(&mut files, home.join(".bashrc"));
     }
@@ -356,24 +399,26 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn startup_file_sources_loader(env: &Environment, startup_path: &Path) -> Result<bool> {
-    let Some(contents) = read_utf8_file_if_exists(env, startup_path)? else {
-        return Ok(false);
-    };
-
-    Ok(BASH_LOADER_PATHS
-        .iter()
-        .filter(|path| env.path_exists(Path::new(path)))
-        .any(|path| contents.lines().any(|line| line_sources_loader(line, path))))
-}
-
-fn startup_file_sources_profile_script(
+fn file_reaches_loader(
     env: &Environment,
     startup_path: &Path,
+    visited: &mut BTreeSet<PathBuf>,
 ) -> Result<Option<PathBuf>> {
+    if !visited.insert(startup_path.to_path_buf()) {
+        return Ok(None);
+    }
+
     let Some(contents) = read_utf8_file_if_exists(env, startup_path)? else {
         return Ok(None);
     };
+
+    if BASH_LOADER_PATHS
+        .iter()
+        .filter(|path| env.path_exists(Path::new(path)))
+        .any(|path| contents.lines().any(|line| line_sources_loader(line, path)))
+    {
+        return Ok(Some(startup_path.to_path_buf()));
+    }
 
     for profile_dir in [
         Path::new("/etc/profile.d"),
@@ -381,8 +426,8 @@ fn startup_file_sources_profile_script(
         Path::new("/opt/homebrew/etc/profile.d"),
     ] {
         for target in direct_profile_script_targets(&contents, profile_dir) {
-            if startup_file_sources_loader(env, &target)? {
-                return Ok(Some(target));
+            if let Some(wired_path) = file_reaches_loader(env, &target, visited)? {
+                return Ok(Some(wired_path));
             }
         }
 
@@ -397,14 +442,43 @@ fn startup_file_sources_profile_script(
                     continue;
                 }
 
-                if startup_file_sources_loader(env, &entry)? {
-                    return Ok(Some(entry));
+                if let Some(wired_path) = file_reaches_loader(env, &entry, visited)? {
+                    return Ok(Some(wired_path));
                 }
             }
         }
     }
 
+    for target in contents
+        .lines()
+        .flat_map(line_source_targets)
+        .filter_map(|target| resolve_sourced_path(env, target))
+    {
+        if let Some(wired_path) = file_reaches_loader(env, &target, visited)? {
+            return Ok(Some(wired_path));
+        }
+    }
+
     Ok(None)
+}
+
+fn resolve_sourced_path(env: &Environment, target: &str) -> Option<PathBuf> {
+    if Path::new(target).is_absolute() {
+        return Some(PathBuf::from(target));
+    }
+
+    let home = env.home_dir().ok()?;
+    if let Some(path) = target.strip_prefix("~/") {
+        return Some(home.join(path));
+    }
+    if let Some(path) = target.strip_prefix("$HOME/") {
+        return Some(home.join(path));
+    }
+    if let Some(path) = target.strip_prefix("${HOME}/") {
+        return Some(home.join(path));
+    }
+
+    None
 }
 
 fn line_sources_loader(line: &str, loader_path: &str) -> bool {
@@ -412,15 +486,11 @@ fn line_sources_loader(line: &str, loader_path: &str) -> bool {
 }
 
 fn direct_profile_script_targets(contents: &str, profile_dir: &Path) -> Vec<PathBuf> {
-    let Some(profile_dir) = profile_dir.to_str() else {
-        return Vec::new();
-    };
-
     contents
         .lines()
         .flat_map(line_source_targets)
-        .filter(|target| target.starts_with(profile_dir))
         .map(PathBuf::from)
+        .filter(|target| target.starts_with(profile_dir))
         .collect()
 }
 
@@ -432,21 +502,29 @@ enum ProfileDirWalkMode {
 
 fn line_walks_profile_dir(line: &str, profile_dir: &Path) -> Option<ProfileDirWalkMode> {
     let profile_dir = profile_dir.to_str()?;
+    let glob = format!("{profile_dir}/*.sh");
     let trimmed = line.trim_start();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
 
-    if !trimmed.contains(profile_dir) {
-        return None;
-    }
-
-    if trimmed.contains("*.sh") {
-        return Some(ProfileDirWalkMode::GlobSh);
-    }
-
-    if trimmed.contains("run-parts") {
-        return Some(ProfileDirWalkMode::RunParts);
+    for segment in trimmed.split("&&").flat_map(|segment| segment.split(';')) {
+        let command = normalize_shell_command(segment);
+        let tokens: Vec<_> = command
+            .split_whitespace()
+            .map(unquote_shell_token)
+            .collect();
+        let looks_like_for_glob_walk = tokens.first().is_some_and(|token| *token == "for")
+            && tokens.contains(&"in")
+            && tokens.iter().any(|token| *token == glob);
+        if looks_like_for_glob_walk {
+            return Some(ProfileDirWalkMode::GlobSh);
+        }
+        if tokens.first().is_some_and(|token| *token == "run-parts")
+            && tokens.iter().skip(1).any(|token| *token == profile_dir)
+        {
+            return Some(ProfileDirWalkMode::RunParts);
+        }
     }
 
     None
@@ -473,23 +551,38 @@ fn line_source_targets(line: &str) -> Vec<&str> {
     trimmed
         .split("&&")
         .flat_map(|segment| segment.split(';'))
-        .map(str::trim)
-        .map(|command| command.strip_prefix("then ").unwrap_or(command))
-        .map(|command| command.strip_prefix("do ").unwrap_or(command))
+        .map(normalize_shell_command)
         .filter_map(command_source_target)
         .collect()
 }
 
 fn command_source_target(command: &str) -> Option<&str> {
-    let remainder = command
-        .strip_prefix("source ")
-        .or_else(|| command.strip_prefix(". "))?;
+    let mut tokens = command.split_whitespace();
+    match tokens.next()? {
+        "source" | "." => tokens.next().map(unquote_shell_token),
+        _ => None,
+    }
+    .filter(|value| !value.is_empty())
+}
 
-    remainder
-        .split_whitespace()
-        .next()
-        .map(unquote_shell_token)
-        .filter(|value| !value.is_empty())
+fn normalize_shell_command(command: &str) -> &str {
+    let command = command.trim();
+    let command = strip_shell_keyword(command, "then");
+    strip_shell_keyword(command, "do")
+}
+
+fn strip_shell_keyword<'a>(command: &'a str, keyword: &str) -> &'a str {
+    let Some(remainder) = command.strip_prefix(keyword) else {
+        return command;
+    };
+    let Some(next) = remainder.chars().next() else {
+        return command;
+    };
+    if next.is_whitespace() {
+        remainder.trim_start()
+    } else {
+        command
+    }
 }
 
 fn unquote_shell_token(token: &str) -> &str {
@@ -571,6 +664,153 @@ mod tests {
             status,
             LoaderStatus::WiredInStartup(home.join(".bash_profile"))
         );
+    }
+
+    #[test]
+    fn loader_status_accepts_tab_after_source_keyword() {
+        let temp_root = crate::tests::temp_dir("bash-loader-source-tab");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(
+            home.join(".bash_profile"),
+            "source\t/usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".bash_profile should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(
+            status,
+            LoaderStatus::WiredInStartup(home.join(".bash_profile"))
+        );
+    }
+
+    #[test]
+    fn loader_status_accepts_tab_separated_then_dot_bashrc_chain() {
+        let temp_root = crate::tests::temp_dir("bash-loader-then-dot-tab-chain");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(
+            home.join(".bash_profile"),
+            "if [ -f \"$HOME/.bashrc\" ]; then\t.\t\"$HOME/.bashrc\"; fi\n",
+        )
+        .expect(".bash_profile should be writable");
+        fs::write(
+            home.join(".bashrc"),
+            "source /usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".bashrc should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::WiredInStartup(home.join(".bashrc")));
+    }
+
+    #[test]
+    fn loader_status_follows_tilde_sourced_bashrc_chain() {
+        let temp_root = crate::tests::temp_dir("bash-loader-tilde-chain");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(
+            home.join(".bash_profile"),
+            "if [ -f ~/.bashrc ]; then\n  . ~/.bashrc\nfi\n",
+        )
+        .expect(".bash_profile should be writable");
+        fs::write(
+            home.join(".bashrc"),
+            "source /usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".bashrc should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::WiredInStartup(home.join(".bashrc")));
+    }
+
+    #[test]
+    fn loader_status_follows_home_expanded_bashrc_chain() {
+        let temp_root = crate::tests::temp_dir("bash-loader-home-chain");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(
+            home.join(".bash_profile"),
+            "if [ -f \"$HOME/.bashrc\" ]; then\n  source \"$HOME/.bashrc\"\nfi\n",
+        )
+        .expect(".bash_profile should be writable");
+        fs::write(
+            home.join(".bashrc"),
+            "source /usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".bashrc should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::WiredInStartup(home.join(".bashrc")));
+    }
+
+    #[test]
+    fn loader_status_is_wired_when_bashrc_sources_etc_bashrc_that_sources_loader() {
+        let temp_root = crate::tests::temp_dir("bash-loader-via-etc-bashrc");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::write(home.join(".bashrc"), "source /etc/bashrc\n")
+            .expect(".bashrc should be writable");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents(
+                "/etc/bashrc",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(
+            status,
+            LoaderStatus::WiredInStartup(PathBuf::from("/etc/bashrc"))
+        );
+    }
+
+    #[test]
+    fn loader_status_does_not_assume_etc_bashrc_is_reachable_without_startup_wiring() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents(
+                "/etc/bashrc",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::PresentButUnwired);
     }
 
     #[test]
@@ -695,6 +935,50 @@ mod tests {
     }
 
     #[test]
+    fn loader_status_does_not_treat_different_profile_d_prefix_as_reachable() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents("/etc/profile", "for i in /etc/profile.d-custom/*.sh; do . \"$i\"; done\nrun-parts /etc/profile.d-custom\n")
+            .with_dir_entries(
+                "/etc/profile.d",
+                [PathBuf::from("/etc/profile.d/bash-completion.sh")],
+            )
+            .with_file_contents(
+                "/etc/profile.d/bash-completion.sh",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::PresentButUnwired);
+    }
+
+    #[test]
+    fn loader_status_does_not_treat_echoed_profile_d_glob_as_wiring() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/test-home")
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .with_file_contents("/etc/profile", "echo /etc/profile.d/*.sh >/dev/null\n")
+            .with_dir_entries(
+                "/etc/profile.d",
+                [PathBuf::from("/etc/profile.d/bash-completion.sh")],
+            )
+            .with_file_contents(
+                "/etc/profile.d/bash-completion.sh",
+                "source /usr/share/bash-completion/bash_completion\n",
+            )
+            .without_real_path_lookups();
+
+        let status = loader_status(&env).expect("status should resolve");
+
+        assert_eq!(status, LoaderStatus::PresentButUnwired);
+    }
+
+    #[test]
     fn loader_status_respects_login_file_precedence() {
         let temp_root = crate::tests::temp_dir("bash-loader-login-precedence");
         let home = temp_root.join("home");
@@ -798,6 +1082,23 @@ mod tests {
     }
 
     #[test]
+    fn install_quotes_bashrc_path_in_next_step_when_home_has_spaces() {
+        let temp_root = crate::tests::temp_dir("bash-loader-install-next-step");
+        let home = temp_root.join("home with space");
+        let target = home.join(".local/share/bash-completion/completions/tool");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = install(&env, "tool", &target).expect("install should succeed");
+
+        let next_step = report.report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("source '"));
+        assert!(next_step.contains("home with space/.bashrc"));
+    }
+
+    #[test]
     fn detect_requires_manual_action_when_file_missing() {
         let env = Environment::test()
             .without_var("BASH_COMPLETION_VERSINFO")
@@ -894,6 +1195,37 @@ mod tests {
     }
 
     #[test]
+    fn detect_unwired_guidance_uses_actual_bashrc_and_completion_paths() {
+        let temp_root = crate::tests::temp_dir("bash-detect-unwired-guidance");
+        let home = temp_root.join("home with space");
+        let completion_path = home.join(".local/share/bash-completion/completions/tool");
+        fs::create_dir_all(
+            completion_path
+                .parent()
+                .expect("completion path should have a parent"),
+        )
+        .expect("completion dir should be creatable");
+        fs::write(&completion_path, "complete -F _tool tool\n")
+            .expect("completion file should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = detect(&env, "tool", &completion_path).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::ManagedRcBlock);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("source '"));
+        assert!(next_step.contains("home with space/.bashrc"));
+        assert!(
+            next_step.contains("home with space/.local/share/bash-completion/completions/tool")
+        );
+    }
+
+    #[test]
     fn detect_reports_corruption_when_duplicate_managed_block_is_malformed() {
         let temp_root = crate::tests::temp_dir("bash-detect-corrupt-duplicate");
         let home = temp_root.join("home");
@@ -921,6 +1253,37 @@ mod tests {
         let error = detect(&env, "tool", &completion_path).expect_err("detect should fail");
 
         assert!(matches!(error, crate::Error::ManagedBlockMissingEnd { .. }));
+    }
+
+    #[test]
+    fn detect_reports_manual_action_when_duplicate_managed_blocks_exist() {
+        let temp_root = crate::tests::temp_dir("bash-detect-duplicate-managed");
+        let home = temp_root.join("home");
+        let completion_path = home.join(".local/share/bash-completion/completions/tool");
+        fs::create_dir_all(
+            completion_path
+                .parent()
+                .expect("completion path should have a parent"),
+        )
+        .expect("completion dir should be creatable");
+        fs::write(&completion_path, "complete -F _tool tool\n")
+            .expect("completion file should be writable");
+        fs::write(
+            home.join(".bashrc"),
+            "# >>> shellcomp bash tool >>>\nif [ -f '/tmp/tool' ]; then\n  . '/tmp/tool'\nfi\n# <<< shellcomp bash tool <<<\n# >>> shellcomp bash tool >>>\nif [ -f '/tmp/tool' ]; then\n  . '/tmp/tool'\nfi\n# <<< shellcomp bash tool <<<\n",
+        )
+        .expect(".bashrc should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .without_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
+
+        let report = detect(&env, "tool", &completion_path).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::ManagedRcBlock);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
     }
 
     #[test]

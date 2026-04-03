@@ -6,6 +6,7 @@ pub(crate) mod uninstall;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::infra::env::Environment;
 use crate::model::{
     ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
     FailureReport, FileChange, Operation, Shell,
@@ -45,11 +46,10 @@ pub(crate) fn manual_activation_report(
             "Add `. {}` to `$PROFILE.CurrentUserAllHosts` or another PowerShell profile.",
             powershell_quote(target)
         ),
-        Shell::Elvish => {
-            format!(
-                "Evaluate `{target}` from your Elvish rc.elv. If you use a command such as `slurp`, make sure the installed path is quoted correctly for Elvish."
-            )
-        }
+        Shell::Elvish => format!(
+            "Add `eval (slurp < {})` to your Elvish rc.elv.",
+            elvish_quote(target)
+        ),
         Shell::Other(_) => format!("Activate `{target}` manually for `{shell}`."),
     };
 
@@ -78,6 +78,48 @@ pub(crate) fn manual_activation_report(
     })
 }
 
+pub(crate) fn missing_completion_next_step(
+    shell: &Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> Result<String> {
+    let target = target_path.to_str().ok_or_else(|| Error::NonUtf8Path {
+        path: target_path.to_path_buf(),
+    })?;
+
+    Ok(match shell {
+        Shell::Bash => format!(
+            "Run your CLI's completion install command, or install the script at `{target}` and source it from your shell startup file."
+        ),
+        Shell::Zsh => {
+            let expected = format!("_{program_name}");
+            if target_path.file_name().and_then(|value| value.to_str()) == Some(expected.as_str()) {
+                format!(
+                    "Run your CLI's completion install command, or place `{target}` in a directory listed in `fpath` and run `compinit -i`."
+                )
+            } else {
+                format!(
+                    "Run your CLI's completion install command, or place the file at `{target}`, rename it to `{expected}`, and ensure its directory is in `fpath` before running `compinit -i`."
+                )
+            }
+        }
+        Shell::Fish => format!(
+            "Run your CLI's completion install command, or place the completion file at `{target}` manually."
+        ),
+        Shell::Powershell => format!(
+            "Run your CLI's completion install command, or place the script at `{target}` and add `. {}` to a PowerShell profile.",
+            powershell_quote(target)
+        ),
+        Shell::Elvish => format!(
+            "Run your CLI's completion install command, or place the script at `{target}` and add `eval (slurp < {})` to rc.elv.",
+            elvish_quote(target)
+        ),
+        Shell::Other(_) => format!(
+            "Run your CLI's completion install command, or install `{target}` manually for `{shell}`."
+        ),
+    })
+}
+
 pub(crate) fn push_unique(paths: &mut Vec<PathBuf>, path: impl Into<PathBuf>) {
     let path = path.into();
     if !paths.iter().any(|existing| existing == &path) {
@@ -90,7 +132,19 @@ pub(crate) fn zsh_target_is_autoloadable(program_name: &str, target_path: &Path)
     target_path.file_name().and_then(|value| value.to_str()) == Some(expected.as_str())
 }
 
+pub(crate) fn home_env_hint(env: &Environment, shell: &Shell) -> &'static str {
+    if matches!(shell, Shell::Powershell) && env.is_windows_platform() {
+        "HOME or USERPROFILE"
+    } else {
+        "HOME"
+    }
+}
+
 fn powershell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "''"))
+}
+
+fn elvish_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "''"))
 }
 

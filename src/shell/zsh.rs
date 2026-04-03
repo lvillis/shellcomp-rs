@@ -31,7 +31,7 @@ pub(crate) fn install(
             ),
             next_step: Some(format!(
                 "Run `source {}` or start a new Zsh session.",
-                rc_path.display()
+                shell_quote(&rc_path)?
             )),
         },
         affected_locations: vec![rc_path],
@@ -75,20 +75,33 @@ pub(crate) fn detect(
     let rc_path = zshrc_path(env)?;
     let block = managed_block(program_name, target_path)?;
     let wired = managed_block::matches(&rc_path, &block)?;
+    let quoted_rc_path = shell_quote(&rc_path)?;
+    let quoted_completion_dir = shell_quote(target_path.parent().unwrap_or(target_path))?;
 
     if !fs::file_exists(target_path) {
         return Ok(ActivationReport {
             mode: ActivationMode::ManagedRcBlock,
             availability: Availability::ManualActionRequired,
-            location: Some(target_path.to_path_buf()),
-            reason: Some(format!(
-                "Completion file `{}` is not installed.",
-                target_path.display()
+            location: Some(if wired {
+                rc_path.clone()
+            } else {
+                target_path.to_path_buf()
+            }),
+            reason: Some(if wired {
+                format!(
+                    "Managed zsh activation block is present, but completion file `{}` is not installed.",
+                    target_path.display()
+                )
+            } else {
+                format!(
+                    "Completion file `{}` is not installed.",
+                    target_path.display()
+                )
+            }),
+            next_step: Some(format!(
+                "Run your CLI's completion install command or place the file into {}.",
+                quoted_completion_dir
             )),
-            next_step: Some(
-                "Run your CLI's completion install command or place the file into the managed zsh directory."
-                    .to_owned(),
-            ),
         });
     }
 
@@ -107,10 +120,12 @@ pub(crate) fn detect(
                 .to_owned()
         }),
         next_step: Some(if wired {
-            "Run `source ~/.zshrc` or start a new Zsh session.".to_owned()
+            format!("Run `source {quoted_rc_path}` or start a new Zsh session.")
         } else {
-            "Re-run installation or add the completion directory to `fpath` and run `compinit -i`."
-                .to_owned()
+            format!(
+                "Re-run installation or add {} to `fpath` and run `compinit -i`.",
+                quoted_completion_dir
+            )
         }),
     })
 }
@@ -161,9 +176,9 @@ fn zshrc_path(env: &Environment) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::install;
-    use super::managed_block;
+    use super::{detect, install, managed_block};
     use crate::infra::env::Environment;
+    use crate::model::{ActivationMode, Availability};
     use std::path::Path;
 
     #[test]
@@ -194,5 +209,72 @@ mod tests {
             install(&env, "tool", &home.join(".zfunc/_tool")).expect_err("install should fail");
 
         assert!(matches!(error, crate::Error::Io { .. }));
+    }
+
+    #[test]
+    fn install_quotes_zshrc_path_in_next_step_when_zdotdir_has_spaces() {
+        let temp_root = crate::tests::temp_dir("install-zsh-next-step");
+        let home = temp_root.join("home");
+        let zdotdir = temp_root.join("zdot dir");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .with_var("ZDOTDIR", &zdotdir)
+            .without_real_path_lookups();
+
+        let report =
+            install(&env, "tool", &zdotdir.join(".zfunc/_tool")).expect("install should work");
+
+        let next_step = report.report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("source '"));
+        assert!(next_step.contains("zdot dir/.zshrc"));
+    }
+
+    #[test]
+    fn detect_uses_actual_zdotdir_path_in_next_step() {
+        let temp_root = crate::tests::temp_dir("detect-zsh-zdotdir-next-step");
+        let home = temp_root.join("home");
+        let zdotdir = temp_root.join("zdot dir");
+        let target = zdotdir.join(".zfunc/_tool");
+        std::fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("target dir should be creatable");
+        std::fs::write(&target, "#compdef tool\n").expect("target should be writable");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .with_var("ZDOTDIR", &zdotdir)
+            .without_real_path_lookups();
+        install(&env, "tool", &target).expect("install should work");
+
+        let report = detect(&env, "tool", &target).expect("detect should work");
+
+        assert_eq!(report.mode, ActivationMode::ManagedRcBlock);
+        assert_eq!(report.availability, Availability::AvailableAfterSource);
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("source '"));
+        assert!(next_step.contains("zdot dir/.zshrc"));
+        assert!(!next_step.contains("~/.zshrc"));
+    }
+
+    #[test]
+    fn detect_unwired_guidance_uses_actual_zfunc_directory() {
+        let temp_root = crate::tests::temp_dir("detect-zsh-unwired-guidance");
+        let home = temp_root.join("home");
+        let zdotdir = temp_root.join("zdot dir");
+        let target = zdotdir.join(".zfunc/_tool");
+        std::fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("target dir should be creatable");
+        std::fs::write(&target, "#compdef tool\n").expect("target should be writable");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .with_var("ZDOTDIR", &zdotdir)
+            .without_real_path_lookups();
+
+        let report = detect(&env, "tool", &target).expect("detect should work");
+
+        assert_eq!(report.mode, ActivationMode::ManagedRcBlock);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("fpath"));
+        assert!(next_step.contains("zdot dir/.zfunc"));
+        assert!(!next_step.contains("~/.zshrc"));
     }
 }

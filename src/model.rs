@@ -37,6 +37,36 @@ impl Display for Shell {
     }
 }
 
+#[cfg(feature = "clap")]
+impl From<::clap_complete::Shell> for Shell {
+    fn from(shell: ::clap_complete::Shell) -> Self {
+        match shell {
+            ::clap_complete::Shell::Bash => Self::Bash,
+            ::clap_complete::Shell::Elvish => Self::Elvish,
+            ::clap_complete::Shell::Fish => Self::Fish,
+            ::clap_complete::Shell::PowerShell => Self::Powershell,
+            ::clap_complete::Shell::Zsh => Self::Zsh,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "clap")]
+impl TryFrom<Shell> for ::clap_complete::Shell {
+    type Error = crate::Error;
+
+    fn try_from(shell: Shell) -> std::result::Result<Self, Self::Error> {
+        match shell {
+            Shell::Bash => Ok(Self::Bash),
+            Shell::Elvish => Ok(Self::Elvish),
+            Shell::Fish => Ok(Self::Fish),
+            Shell::Powershell => Ok(Self::PowerShell),
+            Shell::Zsh => Ok(Self::Zsh),
+            Shell::Other(value) => Err(crate::Error::UnsupportedShell(Shell::Other(value))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Result of a file mutation.
 ///

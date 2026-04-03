@@ -7,8 +7,8 @@ use crate::model::{
     InstallReport, InstallRequest, Operation, Shell,
 };
 use crate::service::{
-    FailureContext, FailureStatus, failure, failure_with_status, manual_activation_report,
-    push_unique, zsh_target_is_autoloadable,
+    FailureContext, FailureStatus, failure, failure_with_status, home_env_hint,
+    manual_activation_report, push_unique, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -29,8 +29,8 @@ pub(crate) fn execute_with_policy(
     activation_policy: ActivationPolicy,
 ) -> Result<InstallReport> {
     paths::validate_program_name(request.program_name)?;
-    let target_path =
-        resolve_target_path(env, &request).map_err(|error| map_resolve_error(&request, error))?;
+    let target_path = resolve_target_path(env, &request)
+        .map_err(|error| map_resolve_error(env, &request, error))?;
     let file_change = fs::write_if_changed(&target_path, request.script)
         .map_err(|error| map_write_error(&request, &target_path, error))?;
 
@@ -41,7 +41,7 @@ pub(crate) fn execute_with_policy(
         let outcome =
             shell::install_default(env, &request.shell, request.program_name, &target_path)
                 .map_err(|error| {
-                    map_activation_error(&request.shell, &target_path, file_change, error)
+                    map_activation_error(env, &request.shell, &target_path, file_change, error)
                 })?;
         for path in outcome.affected_locations {
             push_unique(&mut affected_locations, path);
@@ -97,6 +97,7 @@ fn manual_policy_activation(
                 Err(_) if matches!(activation_policy, ActivationPolicy::Manual) => None,
                 Err(error) => {
                     return Err(map_activation_error(
+                        env,
                         &request.shell,
                         target_path,
                         file_change,
@@ -119,7 +120,7 @@ fn manual_policy_activation(
         request.path_override.is_some(),
         activation_policy,
     )
-    .map_err(|error| map_activation_error(&request.shell, target_path, file_change, error))
+    .map_err(|error| map_activation_error(env, &request.shell, target_path, file_change, error))
 }
 
 fn target_matches_default(
@@ -163,7 +164,7 @@ fn resolve_target_path(env: &Environment, request: &InstallRequest<'_>) -> Resul
     }
 }
 
-fn map_resolve_error(request: &InstallRequest<'_>, error: Error) -> Error {
+fn map_resolve_error(env: &Environment, request: &InstallRequest<'_>, error: Error) -> Error {
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -173,10 +174,15 @@ fn map_resolve_error(request: &InstallRequest<'_>, error: Error) -> Error {
                 affected_locations: Vec::new(),
                 kind: FailureKind::MissingHome,
             },
-            "Could not resolve the default managed install path because HOME is not set.",
+            format!(
+                "Could not resolve the default managed install path because {} is not set.",
+                home_env_hint(env, &request.shell)
+            ),
             Some(
-                "Set HOME for the current process or pass `path_override` to install into an explicit path."
-                    .to_owned(),
+                format!(
+                    "Set {} for the current process or pass `path_override` to install into an explicit path.",
+                    home_env_hint(env, &request.shell)
+                ),
             ),
         ),
         Error::PathHasNoParent { path } => failure(
@@ -231,6 +237,7 @@ fn map_write_error(request: &InstallRequest<'_>, target_path: &Path, error: Erro
             ),
             Some(default_write_next_step(
                 &request.shell,
+                target_path,
                 request.path_override.is_some(),
             )),
         ),
@@ -248,6 +255,7 @@ fn map_write_error(request: &InstallRequest<'_>, target_path: &Path, error: Erro
             ),
             Some(default_write_next_step(
                 &request.shell,
+                target_path,
                 request.path_override.is_some(),
             )),
         ),
@@ -255,49 +263,80 @@ fn map_write_error(request: &InstallRequest<'_>, target_path: &Path, error: Erro
     }
 }
 
-fn default_write_next_step(shell: &Shell, has_override: bool) -> String {
+fn default_write_next_step(shell: &Shell, target_path: &Path, has_override: bool) -> String {
     match shell {
         Shell::Bash => {
             if has_override {
-                "Choose a writable custom path, then source that file manually from a Bash startup file.".to_owned()
+                format!(
+                    "Choose a writable custom path, then source {} manually from a Bash startup file.",
+                    sh_single_quote(target_path)
+                )
             } else {
-                "Choose a writable path with `path_override`, or install the completion file manually into a bash-completion directory.".to_owned()
+                format!(
+                    "Choose a writable path with `path_override`, or install the completion file manually at {}.",
+                    sh_single_quote(target_path)
+                )
             }
         }
         Shell::Zsh => {
+            let completion_dir = target_path
+                .parent()
+                .map_or_else(|| sh_single_quote(target_path), sh_single_quote);
             if has_override {
-                "Choose a writable custom path, then add its directory to `fpath` and run `compinit -i` manually.".to_owned()
+                format!(
+                    "Choose a writable custom path, then add {} to `fpath` and run `compinit -i` manually.",
+                    completion_dir
+                )
             } else {
-                "Choose a writable path with `path_override`, or create the managed zsh completion directory manually.".to_owned()
+                format!(
+                    "Choose a writable path with `path_override`, or place the completion file at {} and ensure {} is on `fpath`.",
+                    sh_single_quote(target_path),
+                    completion_dir
+                )
             }
         }
         Shell::Fish => {
             if has_override {
-                "Choose a writable custom path, then place or source the file manually in Fish."
-                    .to_owned()
+                format!(
+                    "Choose a writable custom path, then place or source {} manually in Fish.",
+                    sh_single_quote(target_path)
+                )
             } else {
-                "Choose a writable path with `path_override`, or place the file into Fish's completions directory manually.".to_owned()
+                format!(
+                    "Choose a writable path with `path_override`, or place the completion file manually at {}.",
+                    sh_single_quote(target_path)
+                )
             }
         }
         Shell::Powershell => {
-            "Choose a writable path, then dot-source the script from a PowerShell profile."
-                .to_owned()
+            format!(
+                "Choose a writable path, then add `. {}` to a PowerShell profile.",
+                powershell_quote(target_path)
+            )
         }
         Shell::Elvish => {
-            "Choose a writable path, then evaluate the script from your Elvish rc.elv.".to_owned()
+            format!(
+                "Choose a writable path, then add `eval (slurp < {})` to your Elvish rc.elv.",
+                elvish_quote(target_path)
+            )
         }
         Shell::Other(_) => {
-            "Choose a writable path and activate the completion manually.".to_owned()
+            format!(
+                "Choose a writable path and activate the completion file at `{}` manually.",
+                target_path.display()
+            )
         }
     }
 }
 
 fn map_activation_error(
+    env: &Environment,
     shell: &Shell,
     target_path: &Path,
     file_change: FileChange,
     error: Error,
 ) -> Error {
+    let startup_path = error.location().map(Path::to_path_buf);
     if let Error::NonUtf8Path { path } = error {
         return failure_with_status(
             FailureContext {
@@ -336,32 +375,31 @@ fn map_activation_error(
         Shell::Bash => (
             "Could not update the managed Bash startup block.".to_owned(),
             Some(format!(
-                "Source `{}` manually from a writable Bash startup file, or use `path_override` and handle activation yourself.",
-                target_path.display()
+                "Source {} manually from a writable Bash startup file, or use `path_override` and handle activation yourself.",
+                sh_single_quote(target_path)
             )),
         ),
         Shell::Zsh => (
             "Could not update the managed Zsh startup block.".to_owned(),
             Some(format!(
-                "Add `{}` to `fpath` manually and run `compinit -i`, or use `path_override` and handle activation yourself.",
-                target_path.parent().map_or_else(
-                    || target_path.display().to_string(),
-                    |parent| parent.display().to_string()
-                )
+                "Add {} to `fpath` manually and run `compinit -i`, or use `path_override` and handle activation yourself.",
+                target_path
+                    .parent()
+                    .map_or_else(|| sh_single_quote(target_path), sh_single_quote)
             )),
         ),
         Shell::Powershell => (
             "Could not update the managed PowerShell profile block.".to_owned(),
             Some(format!(
-                "Dot-source `{}` from a PowerShell profile manually, or use `path_override` and handle activation yourself.",
-                target_path.display()
+                "Add `. {}` to a PowerShell profile manually, or use `path_override` and handle activation yourself.",
+                powershell_quote(target_path)
             )),
         ),
         Shell::Elvish => (
             "Could not update the managed Elvish rc.elv block.".to_owned(),
             Some(format!(
-                "Evaluate `{}` from rc.elv manually, or use `path_override` and handle activation yourself.",
-                target_path.display()
+                "Add `eval (slurp < {})` to rc.elv manually, or use `path_override` and handle activation yourself.",
+                elvish_quote(target_path)
             )),
         ),
         _ => return error,
@@ -390,10 +428,21 @@ fn map_activation_error(
                 cleanup: None,
             },
             format!(
-                "Could not resolve the managed {} startup file because HOME is not set.",
-                shell
+                "Could not resolve the managed {} startup file because {} is not set.",
+                shell,
+                home_env_hint(env, shell)
             ),
-            next_step,
+            Some(match next_step {
+                Some(manual_step) => format!(
+                    "Set {} for the current process so shellcomp can resolve the managed startup file, or {}",
+                    home_env_hint(env, shell),
+                    manual_step
+                ),
+                None => format!(
+                    "Set {} for the current process so shellcomp can resolve the managed startup file.",
+                    home_env_hint(env, shell)
+                ),
+            }),
         ),
         Error::Io { path, .. } | Error::InvalidUtf8File { path } => failure_with_status(
             FailureContext {
@@ -409,7 +458,17 @@ fn map_activation_error(
                 cleanup: None,
             },
             reason,
-            next_step,
+            Some(match startup_path.as_deref() {
+                Some(path) => format!(
+                    "Review {} manually, or {}",
+                    path.display(),
+                    next_step.expect(
+                        "shell-specific activation guidance should exist for managed shells"
+                    )
+                ),
+                None => next_step
+                    .expect("shell-specific activation guidance should exist for managed shells"),
+            }),
         ),
         Error::ManagedBlockMissingEnd { path, .. } => failure_with_status(
             FailureContext {
@@ -425,17 +484,39 @@ fn map_activation_error(
                 cleanup: None,
             },
             reason,
-            next_step,
+            Some(match startup_path.as_deref() {
+                Some(path) => format!(
+                    "Repair or remove the malformed block in {} manually, or {}",
+                    path.display(),
+                    next_step.expect(
+                        "shell-specific activation guidance should exist for managed shells"
+                    )
+                ),
+                None => next_step
+                    .expect("shell-specific activation guidance should exist for managed shells"),
+            }),
         ),
         other => other,
     }
+}
+
+fn sh_single_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+fn powershell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
+fn elvish_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{execute, execute_with_policy};
+    use super::{elvish_quote, execute, execute_with_policy, powershell_quote};
     use crate::infra::env::Environment;
     use crate::model::{
         ActivationMode, ActivationPolicy, Availability, FileChange, InstallRequest, Operation,
@@ -528,11 +609,49 @@ mod tests {
     }
 
     #[test]
+    fn install_reports_userprofile_hint_for_windows_powershell_activation_failure() {
+        let temp_root = crate::tests::temp_dir("install-powershell-windows-missing-home");
+        let target = temp_root.join("custom").join("tool.ps1");
+        let env = Environment::test()
+            .with_windows_platform()
+            .without_var("HOME")
+            .without_var("USERPROFILE")
+            .without_real_path_lookups();
+
+        let error = execute_with_policy(
+            &env,
+            InstallRequest {
+                shell: Shell::Powershell,
+                program_name: "tool",
+                script: b"# powershell completion\n",
+                path_override: Some(target),
+            },
+            ActivationPolicy::AutoManaged,
+        )
+        .expect_err("install should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.kind, crate::FailureKind::MissingHome);
+                assert!(report.reason.contains("HOME or USERPROFILE is not set"));
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains("HOME or USERPROFILE"))
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
     fn install_fails_structurally_when_managed_bash_profile_is_not_writable() {
         let temp_root = crate::tests::temp_dir("install-bash-actionable");
         let home = temp_root.join("home");
+        let bashrc = home.join(".bashrc");
         fs::create_dir_all(&home).expect("home should be creatable");
-        fs::create_dir_all(home.join(".bashrc")).expect(".bashrc directory should be creatable");
+        fs::create_dir_all(&bashrc).expect(".bashrc directory should be creatable");
 
         let env = Environment::test()
             .with_var("HOME", &home)
@@ -563,6 +682,12 @@ mod tests {
                         .iter()
                         .any(|path| path.ends_with(".bashrc"))
                 );
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&bashrc.display().to_string()))
+                );
             }
             other => panic!("unexpected error variant: {other}"),
         }
@@ -572,8 +697,9 @@ mod tests {
     fn install_fails_structurally_when_managed_zsh_profile_is_not_writable() {
         let temp_root = crate::tests::temp_dir("install-zsh-structural-failure");
         let home = temp_root.join("home");
+        let zshrc = home.join(".zshrc");
         fs::create_dir_all(&home).expect("home should be creatable");
-        fs::create_dir_all(home.join(".zshrc")).expect(".zshrc directory should be creatable");
+        fs::create_dir_all(&zshrc).expect(".zshrc directory should be creatable");
 
         let env = Environment::test()
             .with_var("HOME", &home)
@@ -604,6 +730,215 @@ mod tests {
                         .iter()
                         .any(|path| path.ends_with(".zshrc"))
                 );
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&zshrc.display().to_string()))
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn install_failure_quotes_bash_manual_guidance_for_paths_with_spaces() {
+        let temp_root = crate::tests::temp_dir("install-bash-failure-guidance-spaces");
+        let home = temp_root.join("home with space");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::create_dir_all(home.join(".bashrc")).expect(".bashrc directory should be creatable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: None,
+            },
+        )
+        .expect_err("install should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                let next_step = report.next_step.expect("next_step should exist");
+                assert!(next_step.contains("Source '"));
+                assert!(
+                    next_step
+                        .contains("home with space/.local/share/bash-completion/completions/tool")
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn install_failure_quotes_powershell_manual_guidance_for_paths_with_spaces() {
+        let temp_root = crate::tests::temp_dir("install-powershell-failure-guidance-spaces");
+        let home = temp_root.join("home with space");
+        fs::create_dir_all(home.join(".config/powershell"))
+            .expect("profile parent should be creatable");
+        fs::create_dir_all(home.join(".config/powershell/profile.ps1"))
+            .expect("profile path should be a directory");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Powershell,
+                program_name: "tool",
+                script: b"# powershell completion\n",
+                path_override: None,
+            },
+        )
+        .expect_err("install should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                let next_step = report.next_step.expect("next_step should exist");
+                assert!(next_step.contains(". '"));
+                assert!(
+                    next_step
+                        .contains("home with space/.local/share/powershell/completions/tool.ps1")
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn install_failure_quotes_zsh_manual_guidance_for_paths_with_spaces() {
+        let temp_root = crate::tests::temp_dir("install-zsh-failure-guidance-spaces");
+        let home = temp_root.join("home");
+        let zdotdir = temp_root.join("zdot dir");
+        fs::create_dir_all(&home).expect("home should be creatable");
+        fs::create_dir_all(zdotdir.join(".zshrc")).expect(".zshrc path should be a directory");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .with_var("ZDOTDIR", &zdotdir)
+            .without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Zsh,
+                program_name: "tool",
+                script: b"#compdef tool\n",
+                path_override: None,
+            },
+        )
+        .expect_err("install should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                let next_step = report.next_step.expect("next_step should exist");
+                assert!(next_step.contains("'"));
+                assert!(next_step.contains("zdot dir/.zfunc"));
+                assert!(next_step.contains("fpath"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn install_failure_uses_executable_elvish_manual_guidance() {
+        let temp_root = crate::tests::temp_dir("install-elvish-failure-guidance-spaces");
+        let home = temp_root.join("home with space");
+        fs::create_dir_all(home.join(".config/elvish")).expect("rc parent should be creatable");
+        fs::create_dir_all(home.join(".config/elvish/rc.elv"))
+            .expect("rc path should be a directory");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Elvish,
+                program_name: "tool",
+                script: b"# elvish completion\n",
+                path_override: None,
+            },
+        )
+        .expect_err("install should fail structurally");
+
+        match error {
+            crate::Error::Failure(report) => {
+                let next_step = report.next_step.expect("next_step should exist");
+                assert!(next_step.contains("eval (slurp < '"));
+                assert!(
+                    next_step.contains("home with space/.config/elvish/lib/shellcomp/tool.elv")
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn install_write_failure_uses_executable_powershell_default_guidance() {
+        let temp_root = crate::tests::temp_dir("install-powershell-write-failure-guidance");
+        let target = temp_root.join("target with space").join("tool.ps1");
+        fs::create_dir_all(&target).expect("target path should be a directory");
+        let env = Environment::test();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Powershell,
+                program_name: "tool",
+                script: b"# powershell completion\n",
+                path_override: Some(target.clone()),
+            },
+        )
+        .expect_err("install should fail on unreadable target");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.kind, crate::FailureKind::CompletionFileUnreadable);
+                let next_step = report.next_step.expect("next_step should exist");
+                assert!(next_step.contains(&format!(". {}", powershell_quote(&target))));
+                assert!(!next_step.contains("<path>"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn install_write_failure_uses_executable_elvish_default_guidance() {
+        let temp_root = crate::tests::temp_dir("install-elvish-write-failure-guidance");
+        let target = temp_root.join("target with space").join("tool.elv");
+        fs::create_dir_all(&target).expect("target path should be a directory");
+        let env = Environment::test();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Elvish,
+                program_name: "tool",
+                script: b"# elvish completion\n",
+                path_override: Some(target.clone()),
+            },
+        )
+        .expect_err("install should fail on unreadable target");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.kind, crate::FailureKind::CompletionFileUnreadable);
+                let next_step = report.next_step.expect("next_step should exist");
+                assert!(next_step.contains(&format!("eval (slurp < {})", elvish_quote(&target))));
+                assert!(!next_step.contains("<path>"));
             }
             other => panic!("unexpected error variant: {other}"),
         }
@@ -613,13 +948,11 @@ mod tests {
     fn install_returns_profile_corrupted_for_malformed_bash_block() {
         let temp_root = crate::tests::temp_dir("install-bash-corrupted");
         let home = temp_root.join("home");
+        let bashrc = home.join(".bashrc");
         let completion_dir = home.join(".local/share/bash-completion/completions");
         fs::create_dir_all(&completion_dir).expect("completion dir should be creatable");
-        fs::write(
-            home.join(".bashrc"),
-            "# >>> shellcomp bash tool >>>\n. '/tmp/tool'\n",
-        )
-        .expect(".bashrc should be writable");
+        fs::write(&bashrc, "# >>> shellcomp bash tool >>>\n. '/tmp/tool'\n")
+            .expect(".bashrc should be writable");
 
         let env = Environment::test()
             .with_var("HOME", &home)
@@ -652,7 +985,12 @@ mod tests {
                         .iter()
                         .any(|path| path.ends_with(".bashrc"))
                 );
-                assert!(report.next_step.is_some());
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&bashrc.display().to_string()))
+                );
             }
             other => panic!("unexpected error variant: {other}"),
         }

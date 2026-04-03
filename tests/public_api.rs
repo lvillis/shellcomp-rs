@@ -297,6 +297,21 @@ mod clap_tests {
     }
 
     #[test]
+    fn render_clap_completion_accepts_reexported_clap_complete_shell() {
+        let script = render_clap_completion::<Cli>(shellcomp::clap_complete::Shell::Fish, "demo")
+            .expect("fish completion should render");
+        let rendered = String::from_utf8(script).expect("rendered script should be utf-8");
+
+        assert!(rendered.contains("demo"));
+    }
+
+    #[test]
+    fn shell_converts_from_reexported_clap_complete_shell() {
+        let shell: Shell = shellcomp::clap_complete::Shell::Zsh.into();
+        assert_eq!(shell, Shell::Zsh);
+    }
+
+    #[test]
     fn render_clap_completion_rejects_other_shell_via_public_api() {
         let error = render_clap_completion::<Cli>(Shell::Other("xonsh".to_owned()), "demo")
             .expect_err("unsupported shell should fail");

@@ -27,8 +27,8 @@ pub(crate) fn install(
             location: Some(profile_path.clone()),
             reason: Some("shellcomp added a managed block to rc.elv.".to_owned()),
             next_step: Some(format!(
-                "Start a new Elvish session or evaluate `{}`.",
-                profile_path.display()
+                "Start a new Elvish session or run `eval (slurp < {})`.",
+                elvish_quote(&profile_path)?
             )),
         },
         affected_locations: vec![profile_path],
@@ -83,14 +83,17 @@ pub(crate) fn detect(
         } else {
             Availability::ManualActionRequired
         },
-        location: Some(if !installed {
+        location: Some(if !installed && !wired {
             target_path.to_path_buf()
-        } else if wired {
-            profile_path.clone()
         } else {
-            target_path.to_path_buf()
+            profile_path.clone()
         }),
-        reason: Some(if !installed {
+        reason: Some(if !installed && wired {
+            format!(
+                "Managed Elvish activation block is present in rc.elv, but completion file `{}` is not installed.",
+                target_path.display()
+            )
+        } else if !installed {
             format!(
                 "Completion file `{}` is not installed.",
                 target_path.display()
@@ -106,13 +109,13 @@ pub(crate) fn detect(
                 .to_owned()
         } else if wired {
             format!(
-                "Start a new Elvish session or evaluate `{}`.",
-                profile_path.display()
+                "Start a new Elvish session or run `eval (slurp < {})`.",
+                elvish_quote(&profile_path)?
             )
         } else {
             format!(
-                "Re-run installation, or evaluate `{}` from your Elvish rc.elv manually.",
-                target_path.display()
+                "Re-run installation, or add `eval (slurp < {})` to your Elvish rc.elv manually.",
+                elvish_quote(target_path)?
             )
         }),
     })
@@ -199,6 +202,23 @@ mod tests {
     }
 
     #[test]
+    fn install_next_step_uses_executable_eval_command_for_rc_path() {
+        let temp_root = crate::tests::temp_dir("elvish-install-next-step");
+        let home = temp_root.join("home with space");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+        let target = home.join(".config/elvish/lib/shellcomp/tool.elv");
+
+        let report = install(&env, "tool", &target).expect("install should work");
+
+        let next_step = report.report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("eval (slurp < '"));
+        assert!(next_step.contains("home with space/.config/elvish/rc.elv"));
+    }
+
+    #[test]
     fn managed_block_imports_os_module_before_using_os_exists() {
         let block = managed_block(
             "tool",
@@ -237,7 +257,7 @@ mod tests {
     #[test]
     fn detect_reports_actionable_guidance_when_rc_block_is_missing() {
         let temp_root = crate::tests::temp_dir("elvish-detect-unwired");
-        let home = temp_root.join("home");
+        let home = temp_root.join("home with space");
         let env = Environment::test()
             .with_var("HOME", &home)
             .without_var("XDG_CONFIG_HOME")
@@ -251,12 +271,13 @@ mod tests {
 
         assert_eq!(report.mode, ActivationMode::ManagedRcBlock);
         assert_eq!(report.availability, Availability::ManualActionRequired);
-        assert!(
-            report
-                .next_step
-                .as_deref()
-                .is_some_and(|text| text.contains("tool.elv") && text.contains("rc.elv"))
+        assert_eq!(
+            report.location,
+            Some(rc_path(&env).expect("rc path should resolve"))
         );
+        assert!(report.next_step.as_deref().is_some_and(|text| {
+            text.contains("eval (slurp < '") && text.contains("tool.elv") && text.contains("rc.elv")
+        }));
     }
 
     #[test]
@@ -336,7 +357,7 @@ mod tests {
         .expect("migration should work");
 
         assert_eq!(report.legacy_change, FileChange::Removed);
-        assert_eq!(report.managed_change, FileChange::Updated);
+        assert_eq!(report.managed_change, FileChange::Created);
         let rendered = std::fs::read_to_string(rc).expect("rc should remain readable");
         assert!(rendered.contains("shellcomp elvish tool"));
         assert!(!rendered.contains("legacy tool"));

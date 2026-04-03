@@ -10,6 +10,7 @@ pub(crate) struct Environment {
     path_overrides: BTreeMap<PathBuf, bool>,
     file_overrides: BTreeMap<PathBuf, Option<Vec<u8>>>,
     dir_entries_overrides: BTreeMap<PathBuf, Vec<PathBuf>>,
+    windows_override: Option<bool>,
     use_real_path_lookups: bool,
 }
 
@@ -20,6 +21,7 @@ impl Default for Environment {
             path_overrides: BTreeMap::new(),
             file_overrides: BTreeMap::new(),
             dir_entries_overrides: BTreeMap::new(),
+            windows_override: None,
             use_real_path_lookups: true,
         }
     }
@@ -107,6 +109,12 @@ impl Environment {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_windows_platform(mut self) -> Self {
+        self.windows_override = Some(true);
+        self
+    }
+
     pub(crate) fn read_file_if_exists(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         if let Some(contents) = self.file_overrides.get(path) {
             return Ok(contents.clone());
@@ -148,6 +156,7 @@ impl Environment {
     fn is_user_scoped_path(&self, path: &Path) -> bool {
         [
             self.var_os("HOME").map(PathBuf::from),
+            self.var_os("USERPROFILE").map(PathBuf::from),
             self.var_os("XDG_CONFIG_HOME").map(PathBuf::from),
             self.var_os("XDG_DATA_HOME").map(PathBuf::from),
             self.var_os("ZDOTDIR").map(PathBuf::from),
@@ -182,5 +191,44 @@ impl Environment {
             return Ok(PathBuf::from(path));
         }
         self.home_dir()
+    }
+
+    pub(crate) fn powershell_default_install_dir(&self) -> Result<PathBuf> {
+        if self.is_windows_platform() {
+            return Ok(self
+                .powershell_home_dir()?
+                .join("Documents")
+                .join("PowerShell")
+                .join("Completions"));
+        }
+
+        Ok(self.xdg_data_home()?.join("powershell").join("completions"))
+    }
+
+    pub(crate) fn powershell_profile_path(&self) -> Result<PathBuf> {
+        if self.is_windows_platform() {
+            return Ok(self
+                .powershell_home_dir()?
+                .join("Documents")
+                .join("PowerShell")
+                .join("profile.ps1"));
+        }
+
+        Ok(self
+            .home_dir()?
+            .join(".config")
+            .join("powershell")
+            .join("profile.ps1"))
+    }
+
+    fn powershell_home_dir(&self) -> Result<PathBuf> {
+        self.var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .or_else(|| self.var_os("HOME").map(PathBuf::from))
+            .ok_or(Error::MissingHome)
+    }
+
+    pub(crate) fn is_windows_platform(&self) -> bool {
+        self.windows_override.unwrap_or(cfg!(windows))
     }
 }

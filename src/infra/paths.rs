@@ -45,9 +45,7 @@ pub(crate) fn default_install_path(
             .join("completions")
             .join(format!("{program_name}.fish"))),
         Shell::Powershell => Ok(env
-            .xdg_data_home()?
-            .join("powershell")
-            .join("completions")
+            .powershell_default_install_dir()?
             .join(format!("{program_name}.ps1"))),
         Shell::Elvish => Ok(env
             .xdg_config_home()?
@@ -124,6 +122,25 @@ mod tests {
         assert_eq!(
             default_install_path(&env, &Shell::Elvish, "tool").expect("elvish path should resolve"),
             std::path::PathBuf::from("/tmp/config/elvish/lib/shellcomp/tool.elv")
+        );
+    }
+
+    #[test]
+    fn resolves_windows_style_powershell_path() {
+        let env = Environment::test()
+            .with_windows_platform()
+            .with_var("USERPROFILE", r"C:\Users\demo")
+            .without_var("HOME")
+            .without_var("XDG_DATA_HOME");
+
+        assert_eq!(
+            default_install_path(&env, &Shell::Powershell, "tool")
+                .expect("powershell path should resolve"),
+            std::path::PathBuf::from(r"C:\Users\demo")
+                .join("Documents")
+                .join("PowerShell")
+                .join("Completions")
+                .join("tool.ps1")
         );
     }
 

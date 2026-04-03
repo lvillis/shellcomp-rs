@@ -8,6 +8,7 @@ ci:
   cargo test --doc --all-features
   cargo test --all-features
   cargo doc --no-deps --all-features
+  RUSTDOCFLAGS='--cfg docsrs' cargo +nightly doc --all-features --no-deps
   cargo publish --dry-run --allow-dirty
 
 patch:

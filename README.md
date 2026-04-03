@@ -75,7 +75,7 @@ fn install_bash_completion(script: &[u8]) -> shellcomp::Result<()> {
 
 ```rust
 use clap::Parser;
-use shellcomp::{InstallRequest, Shell, install, render_clap_completion};
+use shellcomp::{InstallRequest, install, render_clap_completion};
 
 #[derive(Parser)]
 struct Cli {
@@ -84,9 +84,10 @@ struct Cli {
 }
 
 fn install_zsh_completion() -> Result<(), Box<dyn std::error::Error>> {
-    let script = render_clap_completion::<Cli>(Shell::Zsh, "my-cli")?;
+    let generator_shell = shellcomp::clap_complete::Shell::Zsh;
+    let script = render_clap_completion::<Cli>(generator_shell, "my-cli")?;
     let report = install(InstallRequest {
-        shell: Shell::Zsh,
+        shell: generator_shell.into(),
         program_name: "my-cli",
         script: &script,
         path_override: None,
@@ -96,6 +97,15 @@ fn install_zsh_completion() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+If you want to avoid `Shell` naming conflicts, use the re-exported shell type for generation and
+convert it into `shellcomp::Shell` only when you need deployment:
+
+```rust
+use shellcomp::clap_complete::Shell;
+```
+
+If you need lower-level generator APIs such as `generate`, depend on `clap_complete` directly.
 
 The examples above install into managed shell locations. Use `path_override` during local testing if
 you do not want to touch your real shell profile yet.

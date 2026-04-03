@@ -5,7 +5,9 @@ use crate::infra::{env::Environment, paths};
 use crate::model::{
     FailureKind, MigrateManagedBlocksReport, MigrateManagedBlocksRequest, Operation,
 };
-use crate::service::{FailureContext, failure, push_unique, zsh_target_is_autoloadable};
+use crate::service::{
+    FailureContext, failure, home_env_hint, push_unique, zsh_target_is_autoloadable,
+};
 use crate::shell;
 
 pub(crate) fn execute(
@@ -13,8 +15,8 @@ pub(crate) fn execute(
     request: MigrateManagedBlocksRequest<'_>,
 ) -> Result<MigrateManagedBlocksReport> {
     paths::validate_program_name(request.program_name)?;
-    let target_path =
-        resolve_target_path(env, &request).map_err(|error| map_resolve_error(&request, error))?;
+    let target_path = resolve_target_path(env, &request)
+        .map_err(|error| map_resolve_error(env, &request, error))?;
     validate_migration_target(&request, &target_path)?;
 
     let mut affected_locations = Vec::new();
@@ -27,7 +29,7 @@ pub(crate) fn execute(
         &target_path,
         &request.legacy_blocks,
     )
-    .map_err(|error| map_migration_error(&request, &target_path, error))?;
+    .map_err(|error| map_migration_error(env, &request, &target_path, error))?;
 
     for path in outcome.affected_locations {
         push_unique(&mut affected_locations, path);
@@ -58,7 +60,11 @@ fn resolve_target_path(
     }
 }
 
-fn map_resolve_error(request: &MigrateManagedBlocksRequest<'_>, error: Error) -> Error {
+fn map_resolve_error(
+    env: &Environment,
+    request: &MigrateManagedBlocksRequest<'_>,
+    error: Error,
+) -> Error {
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -68,10 +74,15 @@ fn map_resolve_error(request: &MigrateManagedBlocksRequest<'_>, error: Error) ->
                 affected_locations: Vec::new(),
                 kind: FailureKind::MissingHome,
             },
-            "Could not resolve the managed completion path for block migration because HOME is not set.",
+            format!(
+                "Could not resolve the managed completion path for block migration because {} is not set.",
+                home_env_hint(env, &request.shell)
+            ),
             Some(
-                "Set HOME for the current process or pass `path_override` so shellcomp can resolve the target completion path."
-                    .to_owned(),
+                format!(
+                    "Set {} for the current process or pass `path_override` so shellcomp can resolve the target completion path.",
+                    home_env_hint(env, &request.shell)
+                ),
             ),
         ),
         Error::PathHasNoParent { path } => failure(
@@ -107,10 +118,12 @@ fn map_resolve_error(request: &MigrateManagedBlocksRequest<'_>, error: Error) ->
 }
 
 fn map_migration_error(
+    env: &Environment,
     request: &MigrateManagedBlocksRequest<'_>,
     target_path: &std::path::Path,
     error: Error,
 ) -> Error {
+    let startup_path = error.location().map(std::path::Path::to_path_buf);
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -121,13 +134,14 @@ fn map_migration_error(
                 kind: FailureKind::MissingHome,
             },
             format!(
-                "Could not resolve the managed {} startup file during block migration because HOME is not set.",
-                request.shell
+                "Could not resolve the managed {} startup file during block migration because {} is not set.",
+                request.shell,
+                home_env_hint(env, &request.shell)
             ),
-            Some(
-                "Set HOME for the current process or rewrite the startup block manually."
-                    .to_owned(),
-            ),
+            Some(format!(
+                "Set {} for the current process or rewrite the startup block manually.",
+                home_env_hint(env, &request.shell)
+            )),
         ),
         Error::Io { path, .. } | Error::InvalidUtf8File { path } => failure(
             FailureContext {
@@ -141,10 +155,16 @@ fn map_migration_error(
                 "Could not rewrite the managed {} startup file during block migration.",
                 request.shell
             ),
-            Some(
-                "Review the relevant shell startup file manually and remove or replace the legacy block yourself."
-                    .to_owned(),
-            ),
+            Some(match startup_path.as_deref() {
+                Some(path) => format!(
+                    "Review {} manually and remove or replace the legacy block yourself.",
+                    path.display()
+                ),
+                None => {
+                    "Review the relevant shell startup file manually and remove or replace the legacy block yourself."
+                        .to_owned()
+                }
+            }),
         ),
         Error::ManagedBlockMissingEnd { path, .. } => failure(
             FailureContext {
@@ -158,10 +178,14 @@ fn map_migration_error(
                 "Could not rewrite the managed {} startup file because a managed block is malformed.",
                 request.shell
             ),
-            Some(
-                "Repair or remove the malformed block manually, then re-run migration."
+            Some(match startup_path.as_deref() {
+                Some(path) => format!(
+                    "Repair or remove the malformed block in {} manually, then re-run migration.",
+                    path.display()
+                ),
+                None => "Repair or remove the malformed block manually, then re-run migration."
                     .to_owned(),
-            ),
+            }),
         ),
         Error::NonUtf8Path { path } => failure(
             FailureContext {
@@ -251,6 +275,7 @@ mod tests {
         .expect("migration should succeed");
 
         assert_eq!(report.legacy_change, FileChange::Removed);
+        assert_eq!(report.managed_change, FileChange::Created);
         assert!(matches!(
             report.location.as_deref(),
             Some(path) if path.ends_with(".bashrc")
@@ -540,6 +565,12 @@ mod tests {
             crate::Error::Failure(report) => {
                 assert_eq!(report.operation, Operation::MigrateManagedBlocks);
                 assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(".bashrc"))
+                );
             }
             other => panic!("unexpected error variant: {other}"),
         }

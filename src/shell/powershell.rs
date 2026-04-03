@@ -30,8 +30,8 @@ pub(crate) fn install(
                     .to_owned(),
             ),
             next_step: Some(format!(
-                "Start a new PowerShell session or dot-source `{}`.",
-                profile_path.display()
+                "Start a new PowerShell session or run `. {}`.",
+                powershell_quote(&profile_path)?
             )),
         },
         affected_locations: vec![profile_path],
@@ -86,14 +86,17 @@ pub(crate) fn detect(
         } else {
             Availability::ManualActionRequired
         },
-        location: Some(if !installed {
+        location: Some(if !installed && !wired {
             target_path.to_path_buf()
-        } else if wired {
-            profile_path.clone()
         } else {
-            target_path.to_path_buf()
+            profile_path.clone()
         }),
-        reason: Some(if !installed {
+        reason: Some(if !installed && wired {
+            format!(
+                "Managed PowerShell activation block is present in the CurrentUserAllHosts profile, but completion file `{}` is not installed.",
+                target_path.display()
+            )
+        } else if !installed {
             format!(
                 "Completion file `{}` is not installed.",
                 target_path.display()
@@ -110,8 +113,8 @@ pub(crate) fn detect(
                 .to_owned()
         } else if wired {
             format!(
-                "Start a new PowerShell session or dot-source `{}`.",
-                profile_path.display()
+                "Start a new PowerShell session or run `. {}`.",
+                powershell_quote(&profile_path)?
             )
         } else {
             format!(
@@ -153,11 +156,7 @@ fn managed_block(program_name: &str, target_path: &Path) -> Result<ManagedBlock>
 }
 
 fn profile_path(env: &Environment) -> Result<std::path::PathBuf> {
-    Ok(env
-        .home_dir()?
-        .join(".config")
-        .join("powershell")
-        .join("profile.ps1"))
+    env.powershell_profile_path()
 }
 
 fn powershell_quote(path: &Path) -> Result<String> {
@@ -200,6 +199,23 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("profile.ps1"))
         );
+    }
+
+    #[test]
+    fn install_next_step_uses_executable_dot_source_command() {
+        let temp_root = crate::tests::temp_dir("powershell-install-next-step");
+        let home = temp_root.join("home with space");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+        let target = home.join(".local/share/powershell/completions/tool.ps1");
+
+        let report = install(&env, "tool", &target).expect("install should work");
+
+        let next_step = report.report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("run `. '"));
+        assert!(next_step.contains("home with space/.config/powershell/profile.ps1"));
     }
 
     #[test]
@@ -274,6 +290,10 @@ mod tests {
 
         assert_eq!(report.mode, ActivationMode::ManagedRcBlock);
         assert_eq!(report.availability, Availability::ManualActionRequired);
+        assert_eq!(
+            report.location,
+            Some(profile_path(&env).expect("profile path should resolve"))
+        );
         assert!(report.next_step.as_deref().is_some_and(|text| {
             text.contains("$PROFILE.CurrentUserAllHosts") && text.contains("tool.ps1")
         }));
@@ -288,6 +308,23 @@ mod tests {
         assert_eq!(
             profile_path(&env).expect("profile path should resolve"),
             std::path::PathBuf::from("/tmp/home/.config/powershell/profile.ps1")
+        );
+    }
+
+    #[test]
+    fn profile_path_uses_windows_documents_directory() {
+        let env = Environment::test()
+            .with_windows_platform()
+            .with_var("USERPROFILE", r"C:\Users\demo")
+            .without_var("HOME")
+            .without_var("XDG_CONFIG_HOME");
+
+        assert_eq!(
+            profile_path(&env).expect("profile path should resolve"),
+            std::path::PathBuf::from(r"C:\Users\demo")
+                .join("Documents")
+                .join("PowerShell")
+                .join("profile.ps1")
         );
     }
 
@@ -338,7 +375,7 @@ mod tests {
         .expect("migration should work");
 
         assert_eq!(report.legacy_change, FileChange::Removed);
-        assert_eq!(report.managed_change, FileChange::Updated);
+        assert_eq!(report.managed_change, FileChange::Created);
         let rendered = std::fs::read_to_string(profile).expect("profile should remain readable");
         assert!(rendered.contains("shellcomp powershell tool"));
         assert!(!rendered.contains("legacy tool"));

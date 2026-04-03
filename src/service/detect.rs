@@ -6,7 +6,8 @@ use crate::model::{
     ActivationPolicy, ActivationReport, Availability, FailureKind, Operation, Shell,
 };
 use crate::service::{
-    FailureContext, failure, manual_activation_report, zsh_target_is_autoloadable,
+    FailureContext, failure, home_env_hint, manual_activation_report, missing_completion_next_step,
+    zsh_target_is_autoloadable,
 };
 use crate::{Error, shell};
 
@@ -17,9 +18,9 @@ pub(crate) fn execute(
 ) -> Result<ActivationReport> {
     paths::validate_program_name(program_name)?;
     let target_path = paths::default_install_path(env, &shell, program_name)
-        .map_err(|error| map_resolve_error(&shell, error))?;
+        .map_err(|error| map_resolve_error(env, &shell, error))?;
     shell::detect_default(env, &shell, program_name, &target_path)
-        .map_err(|error| map_detect_error(&shell, &target_path, error))
+        .map_err(|error| map_detect_error(env, &shell, &target_path, error))
 }
 
 pub(crate) fn execute_at_path(
@@ -33,10 +34,10 @@ pub(crate) fn execute_at_path(
         Shell::Fish => {
             if path_matches_default_target(env, &Shell::Fish, program_name, target_path) {
                 shell::detect_default(env, &shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(&shell, target_path, error))
+                    .map_err(|error| map_detect_error(env, &shell, target_path, error))
             } else {
                 manual_custom_detection_report(&shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(&shell, target_path, error))
+                    .map_err(|error| map_detect_error(env, &shell, target_path, error))
             }
         }
         Shell::Bash => {
@@ -45,7 +46,7 @@ pub(crate) fn execute_at_path(
         Shell::Zsh => {
             if !zsh_target_is_autoloadable(program_name, target_path) {
                 return manual_custom_detection_report(&shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(&shell, target_path, error));
+                    .map_err(|error| map_detect_error(env, &shell, target_path, error));
             }
 
             detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
@@ -54,7 +55,7 @@ pub(crate) fn execute_at_path(
             detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
         }
         _ => shell::detect_default(env, &shell, program_name, target_path)
-            .map_err(|error| map_detect_error(&shell, target_path, error)),
+            .map_err(|error| map_detect_error(env, &shell, target_path, error)),
     }
 }
 
@@ -69,20 +70,20 @@ fn detect_custom_path_with_managed_fallback(
     match shell::detect_default(env, shell, program_name, target_path) {
         Ok(report) => {
             if treat_as_default
-                || !installed
                 || report.availability != Availability::ManualActionRequired
+                || (!installed && report.location.as_deref() != Some(target_path))
             {
                 Ok(report)
             } else {
                 manual_custom_detection_report(shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(shell, target_path, error))
+                    .map_err(|error| map_detect_error(env, shell, target_path, error))
             }
         }
         Err(error) if !treat_as_default && can_fallback_to_manual_custom_detect(&error) => {
             manual_custom_detection_report(shell, program_name, target_path)
-                .map_err(|fallback_error| map_detect_error(shell, target_path, fallback_error))
+                .map_err(|fallback_error| map_detect_error(env, shell, target_path, fallback_error))
         }
-        Err(error) => Err(map_detect_error(shell, target_path, error)),
+        Err(error) => Err(map_detect_error(env, shell, target_path, error)),
     }
 }
 
@@ -133,10 +134,17 @@ fn manual_custom_detection_report(
             target_path.display()
         )
     });
+    if !installed {
+        report.next_step = Some(missing_completion_next_step(
+            shell,
+            program_name,
+            target_path,
+        )?);
+    }
     Ok(report)
 }
 
-fn map_resolve_error(shell: &Shell, error: Error) -> Error {
+fn map_resolve_error(env: &Environment, shell: &Shell, error: Error) -> Error {
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -146,11 +154,14 @@ fn map_resolve_error(shell: &Shell, error: Error) -> Error {
                 affected_locations: Vec::new(),
                 kind: FailureKind::MissingHome,
             },
-            "Could not resolve the managed completion path because HOME is not set.",
-            Some(
-                "Set HOME for the current process so shellcomp can resolve the default managed path."
-                    .to_owned(),
+            format!(
+                "Could not resolve the managed completion path because {} is not set.",
+                home_env_hint(env, shell)
             ),
+            Some(format!(
+                "Set {} for the current process so shellcomp can resolve the default managed path.",
+                home_env_hint(env, shell)
+            )),
         ),
         Error::UnsupportedShell(unsupported) => failure(
             FailureContext {
@@ -169,7 +180,13 @@ fn map_resolve_error(shell: &Shell, error: Error) -> Error {
     }
 }
 
-fn map_detect_error(shell: &Shell, target_path: &std::path::Path, error: Error) -> Error {
+fn map_detect_error(
+    env: &Environment,
+    shell: &Shell,
+    target_path: &std::path::Path,
+    error: Error,
+) -> Error {
+    let startup_path = error.location().map(std::path::Path::to_path_buf);
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -180,12 +197,15 @@ fn map_detect_error(shell: &Shell, target_path: &std::path::Path, error: Error) 
                 kind: FailureKind::MissingHome,
             },
             format!(
-                "Could not resolve the managed {} startup file because HOME is not set.",
-                shell
+                "Could not resolve the managed {} startup file because {} is not set.",
+                shell,
+                home_env_hint(env, shell)
             ),
             Some(
-                "Set HOME for the current process or inspect activation manually for the target completion file."
-                    .to_owned(),
+                format!(
+                    "Set {} for the current process or inspect activation manually for the target completion file.",
+                    home_env_hint(env, shell)
+                ),
             ),
         ),
         Error::Io { path, .. } | Error::InvalidUtf8File { path } => failure(
@@ -197,10 +217,16 @@ fn map_detect_error(shell: &Shell, target_path: &std::path::Path, error: Error) 
                 kind: FailureKind::ProfileUnavailable,
             },
             format!("Could not inspect the managed {} activation state.", shell),
-            Some(
-                "Review the relevant shell startup file manually, or re-run install to restore managed wiring."
-                    .to_owned(),
-            ),
+            Some(match startup_path.as_deref() {
+                Some(path) => format!(
+                    "Review {} manually, or re-run install to restore managed wiring.",
+                    path.display()
+                ),
+                None => {
+                    "Review the relevant shell startup file manually, or re-run install to restore managed wiring."
+                        .to_owned()
+                }
+            }),
         ),
         Error::NonUtf8Path { path } => failure(
             FailureContext {
@@ -228,10 +254,16 @@ fn map_detect_error(shell: &Shell, target_path: &std::path::Path, error: Error) 
                 "The managed {} activation block is malformed and could not be inspected safely.",
                 shell
             ),
-            Some(
-                "Repair or remove the malformed managed block manually, then re-run install."
-                    .to_owned(),
-            ),
+            Some(match startup_path.as_deref() {
+                Some(path) => format!(
+                    "Repair or remove the malformed managed block in {} manually, then re-run install.",
+                    path.display()
+                ),
+                None => {
+                    "Repair or remove the malformed managed block manually, then re-run install."
+                        .to_owned()
+                }
+            }),
         ),
         other => other,
     }
@@ -303,15 +335,41 @@ mod tests {
     }
 
     #[test]
+    fn detect_reports_userprofile_hint_for_windows_powershell_default_path_resolution() {
+        let env = Environment::test()
+            .with_windows_platform()
+            .without_var("HOME")
+            .without_var("USERPROFILE")
+            .without_real_path_lookups();
+
+        let error = execute(&env, Shell::Powershell, "tool").expect_err("detect should fail");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.kind, crate::FailureKind::MissingHome);
+                assert!(report.reason.contains("HOME or USERPROFILE is not set"));
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains("HOME or USERPROFILE"))
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
     fn detect_returns_profile_corrupted_for_malformed_zsh_block() {
         let temp_root = crate::tests::temp_dir("detect-zsh-corrupted");
         let home = temp_root.join("home");
         let completion_dir = home.join(".zfunc");
+        let zshrc = home.join(".zshrc");
         fs::create_dir_all(&completion_dir).expect("completion dir should be creatable");
         fs::write(completion_dir.join("_tool"), b"#compdef tool\n")
             .expect("completion file should be writable");
         fs::write(
-            home.join(".zshrc"),
+            &zshrc,
             "# >>> shellcomp zsh tool >>>\nfpath=(~/.zfunc $fpath)\n",
         )
         .expect(".zshrc should be writable");
@@ -334,7 +392,45 @@ mod tests {
                         .iter()
                         .any(|path| path.ends_with(".zshrc"))
                 );
-                assert!(report.next_step.is_some());
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&zshrc.display().to_string()))
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn detect_reports_actual_profile_path_when_startup_file_is_unreadable() {
+        let temp_root = crate::tests::temp_dir("detect-zsh-unreadable-profile");
+        let home = temp_root.join("home");
+        let zshrc = home.join(".zshrc");
+        let completion_dir = home.join(".zfunc");
+        fs::create_dir_all(&completion_dir).expect("completion dir should be creatable");
+        fs::write(completion_dir.join("_tool"), b"#compdef tool\n")
+            .expect("completion file should be writable");
+        fs::create_dir_all(&zshrc).expect("directory should be creatable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("ZDOTDIR")
+            .without_real_path_lookups();
+
+        let error = execute(&env, Shell::Zsh, "tool").expect_err("detect should fail");
+
+        match error {
+            crate::Error::Failure(report) => {
+                assert_eq!(report.operation, Operation::DetectActivation);
+                assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(&zshrc.display().to_string()))
+                );
             }
             other => panic!("unexpected error variant: {other}"),
         }
@@ -396,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_at_path_reports_manual_for_missing_custom_bash_script_without_managed_wiring() {
+        let temp_root = crate::tests::temp_dir("detect-custom-bash-missing-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.bash");
+        fs::create_dir_all(&home).expect("home should be creatable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Bash, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+    }
+
+    #[test]
     fn detect_at_path_reports_profile_corruption_for_custom_bash_path() {
         let temp_root = crate::tests::temp_dir("detect-custom-bash-corrupted-profile");
         let home = temp_root.join("home");
@@ -449,6 +564,62 @@ mod tests {
         assert_eq!(report.availability, Availability::Unknown);
     }
 
+    #[test]
+    fn detect_at_path_reports_reinstall_guidance_for_missing_custom_fish_script() {
+        let temp_root = crate::tests::temp_dir("detect-custom-fish-missing");
+        let target = temp_root.join("custom").join("tool.fish");
+        let env = Environment::test().without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Fish, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains("install command") && text.contains("tool.fish"))
+        );
+    }
+
+    #[test]
+    fn detect_at_path_reports_reinstall_guidance_for_missing_custom_non_autoloadable_zsh_script() {
+        let temp_root = crate::tests::temp_dir("detect-custom-zsh-missing-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.zsh");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("ZDOTDIR")
+            .without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Zsh, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+        assert!(report.next_step.as_deref().is_some_and(|text| {
+            text.contains("install command") && text.contains("tool.zsh") && text.contains("_tool")
+        }));
+    }
+
+    #[test]
+    fn detect_at_path_reports_manual_for_missing_custom_autoloadable_zsh_script_without_wiring() {
+        let temp_root = crate::tests::temp_dir("detect-custom-zsh-missing-autoloadable");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("_tool");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("ZDOTDIR")
+            .without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Zsh, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+    }
+
     #[cfg(unix)]
     #[test]
     fn detect_at_path_returns_structured_failure_for_non_utf8_path() {
@@ -493,5 +664,60 @@ mod tests {
 
         assert_eq!(report.mode, ActivationMode::Manual);
         assert_eq!(report.availability, Availability::Unknown);
+    }
+
+    #[test]
+    fn detect_at_path_reports_reinstall_guidance_for_missing_custom_powershell_script_without_home()
+    {
+        let temp_root = crate::tests::temp_dir("detect-custom-powershell-missing-no-home");
+        let target = temp_root.join("custom").join("tool.ps1");
+        let env = Environment::test()
+            .without_var("HOME")
+            .without_var("USERPROFILE")
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute_at_path(&env, Shell::Powershell, "tool", &target)
+            .expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+        assert!(report.next_step.as_deref().is_some_and(|text| {
+            text.contains("install command") && text.contains("tool.ps1") && text.contains(". '")
+        }));
+    }
+
+    #[test]
+    fn detect_at_path_reports_manual_for_missing_custom_powershell_script_without_managed_wiring() {
+        let temp_root = crate::tests::temp_dir("detect-custom-powershell-missing-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.ps1");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute_at_path(&env, Shell::Powershell, "tool", &target)
+            .expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
+    }
+
+    #[test]
+    fn detect_at_path_reports_manual_for_missing_custom_elvish_script_without_managed_wiring() {
+        let temp_root = crate::tests::temp_dir("detect-custom-elvish-missing-manual");
+        let home = temp_root.join("home");
+        let target = temp_root.join("custom").join("tool.elv");
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("XDG_CONFIG_HOME")
+            .without_real_path_lookups();
+
+        let report =
+            execute_at_path(&env, Shell::Elvish, "tool", &target).expect("detect should succeed");
+
+        assert_eq!(report.mode, ActivationMode::Manual);
+        assert_eq!(report.availability, Availability::ManualActionRequired);
     }
 }

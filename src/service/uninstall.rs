@@ -7,7 +7,7 @@ use crate::model::{
     UninstallRequest,
 };
 use crate::service::{
-    FailureContext, FailureStatus, failure, failure_with_status, push_unique,
+    FailureContext, FailureStatus, failure, failure_with_status, home_env_hint, push_unique,
     zsh_target_is_autoloadable,
 };
 use crate::shell;
@@ -29,8 +29,8 @@ pub(crate) fn execute_with_policy(
     activation_policy: ActivationPolicy,
 ) -> Result<RemoveReport> {
     paths::validate_program_name(request.program_name)?;
-    let target_path =
-        resolve_target_path(env, &request).map_err(|error| map_resolve_error(&request, error))?;
+    let target_path = resolve_target_path(env, &request)
+        .map_err(|error| map_resolve_error(env, &request, error))?;
     let file_change = fs::remove_file_if_exists(&target_path)
         .map_err(|error| map_file_error(&request, &target_path, error))?;
 
@@ -40,7 +40,9 @@ pub(crate) fn execute_with_policy(
     let cleanup = if should_use_shell_backend(env, &request, activation_policy, &target_path) {
         let outcome =
             shell::uninstall_default(env, &request.shell, request.program_name, &target_path)
-                .map_err(|error| map_cleanup_error(&request, &target_path, file_change, error))?;
+                .map_err(|error| {
+                    map_cleanup_error(env, &request, &target_path, file_change, error)
+                })?;
         for path in outcome.affected_locations {
             push_unique(&mut affected_locations, path);
         }
@@ -134,7 +136,7 @@ fn resolve_target_path(env: &Environment, request: &UninstallRequest<'_>) -> Res
     }
 }
 
-fn map_resolve_error(request: &UninstallRequest<'_>, error: Error) -> Error {
+fn map_resolve_error(env: &Environment, request: &UninstallRequest<'_>, error: Error) -> Error {
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -144,10 +146,15 @@ fn map_resolve_error(request: &UninstallRequest<'_>, error: Error) -> Error {
                 affected_locations: Vec::new(),
                 kind: FailureKind::MissingHome,
             },
-            "Could not resolve the managed completion path because HOME is not set.",
+            format!(
+                "Could not resolve the managed completion path because {} is not set.",
+                home_env_hint(env, &request.shell)
+            ),
             Some(
-                "Set HOME for the current process or pass the exact `path_override` that should be removed."
-                    .to_owned(),
+                format!(
+                    "Set {} for the current process or pass the exact `path_override` that should be removed.",
+                    home_env_hint(env, &request.shell)
+                ),
             ),
         ),
         Error::PathHasNoParent { path } => failure(
@@ -214,11 +221,13 @@ fn map_file_error(
 }
 
 fn map_cleanup_error(
+    env: &Environment,
     request: &UninstallRequest<'_>,
     target_path: &std::path::Path,
     file_change: FileChange,
     error: Error,
 ) -> Error {
+    let cleanup_path = error.location().map(std::path::Path::to_path_buf);
     match error {
         Error::MissingHome => failure_with_status(
             FailureContext {
@@ -234,13 +243,14 @@ fn map_cleanup_error(
                 cleanup: None,
             },
             format!(
-                "Could not resolve the managed {} startup file because HOME is not set.",
-                request.shell
+                "Could not resolve the managed {} startup file because {} is not set.",
+                request.shell,
+                home_env_hint(env, &request.shell)
             ),
-            Some(
-                "Set HOME for the current process or remove the managed shell block manually."
-                    .to_owned(),
-            ),
+            Some(format!(
+                "Set {} for the current process or remove the managed shell block manually.",
+                home_env_hint(env, &request.shell)
+            )),
         ),
         Error::Io { path, .. } | Error::InvalidUtf8File { path } => failure_with_status(
             FailureContext {
@@ -259,10 +269,16 @@ fn map_cleanup_error(
                 "Could not clean up the managed {} activation block.",
                 request.shell
             ),
-            Some(
-                "Review the managed shell startup file manually and remove the shellcomp-managed block yourself."
-                    .to_owned(),
-            ),
+            Some(match cleanup_path.as_deref() {
+                Some(path) => format!(
+                    "Review {} manually and remove the shellcomp-managed block yourself.",
+                    path.display()
+                ),
+                None => {
+                    "Review the managed shell startup file manually and remove the shellcomp-managed block yourself."
+                        .to_owned()
+                }
+            }),
         ),
         Error::ManagedBlockMissingEnd { path, .. } => failure_with_status(
             FailureContext {
@@ -281,10 +297,16 @@ fn map_cleanup_error(
                 "Could not clean up the managed {} activation block.",
                 request.shell
             ),
-            Some(
-                "Review the managed shell startup file manually and remove the shellcomp-managed block yourself."
-                    .to_owned(),
-            ),
+            Some(match cleanup_path.as_deref() {
+                Some(path) => format!(
+                    "Review {} manually and remove the shellcomp-managed block yourself.",
+                    path.display()
+                ),
+                None => {
+                    "Review the managed shell startup file manually and remove the shellcomp-managed block yourself."
+                        .to_owned()
+                }
+            }),
         ),
         other => other,
     }
@@ -336,6 +358,44 @@ mod tests {
 
         let bashrc = fs::read_to_string(home.join(".bashrc")).expect(".bashrc should exist");
         assert!(!bashrc.contains("shellcomp bash tool"));
+    }
+
+    #[test]
+    fn uninstall_reports_system_loader_cleanup_for_loader_wired_bash() {
+        let temp_root = crate::tests::temp_dir("uninstall-bash-system-loader");
+        let home = temp_root.join("home");
+        let completion_dir = home.join(".local/share/bash-completion/completions");
+        let completion_path = completion_dir.join("tool");
+        fs::create_dir_all(&completion_dir).expect("completion dir should be creatable");
+        fs::write(&completion_path, "complete -F _tool tool\n")
+            .expect("completion file should be writable");
+        fs::write(
+            home.join(".bashrc"),
+            "source /usr/share/bash-completion/bash_completion\n",
+        )
+        .expect(".bashrc should be writable");
+
+        let env = Environment::test()
+            .with_var("HOME", &home)
+            .without_var("BASH_COMPLETION_VERSINFO")
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let report = execute(
+            &env,
+            UninstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                path_override: None,
+            },
+        )
+        .expect("uninstall should succeed");
+
+        assert_eq!(report.file_change, FileChange::Removed);
+        assert_eq!(report.cleanup.mode, crate::ActivationMode::SystemLoader);
+        assert_eq!(report.cleanup.change, FileChange::Absent);
+        assert_eq!(report.cleanup.location, Some(home.join(".bashrc")));
     }
 
     #[test]
@@ -426,6 +486,12 @@ mod tests {
                         .any(|path| path.ends_with(".bashrc"))
                 );
                 assert!(report.next_step.is_some());
+                assert!(
+                    report
+                        .next_step
+                        .as_deref()
+                        .is_some_and(|text| text.contains(".bashrc"))
+                );
             }
             other => panic!("unexpected error variant: {other}"),
         }

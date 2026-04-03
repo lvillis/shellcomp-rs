@@ -65,7 +65,6 @@ pub(crate) fn migrate_blocks(
 ) -> Result<(FileChange, FileChange)> {
     let original = read_utf8_file(path)?;
     let original_contents = original.as_deref().unwrap_or_default();
-    let original_exists = original.is_some();
 
     let (without_legacy, legacy_change) =
         rewrite_remove_all(path, original_contents, legacy_blocks)?;
@@ -78,7 +77,7 @@ pub(crate) fn migrate_blocks(
 
     let managed_change = if without_legacy == updated {
         FileChange::Unchanged
-    } else if original_exists || rewritten.found {
+    } else if rewritten.found {
         FileChange::Updated
     } else {
         FileChange::Created
@@ -119,7 +118,8 @@ pub(crate) fn matches(path: &Path, block: &ManagedBlock) -> Result<bool> {
     let expected = block.render();
     let expected = expected.trim_end_matches(['\n', '\r']);
     let mut cursor = 0;
-    let mut matched = false;
+    let mut match_count = 0usize;
+    let mut saw_nonmatching_duplicate = false;
     while let Some(relative_start) = contents[cursor..].find(&block.start_marker) {
         let start = cursor + relative_start;
         let after_start = start + block.start_marker.len();
@@ -140,12 +140,14 @@ pub(crate) fn matches(path: &Path, block: &ManagedBlock) -> Result<bool> {
         }
         let candidate = contents[start..end].trim_end_matches(['\n', '\r']);
         if candidate == expected {
-            matched = true;
+            match_count += 1;
+        } else {
+            saw_nonmatching_duplicate = true;
         }
         cursor = end;
     }
 
-    Ok(matched)
+    Ok(match_count == 1 && !saw_nonmatching_duplicate)
 }
 
 fn read_utf8_file(path: &Path) -> Result<Option<String>> {
@@ -420,6 +422,41 @@ mod tests {
     }
 
     #[test]
+    fn matches_rejects_stale_duplicate_even_when_a_valid_block_exists() {
+        let temp_root = crate::tests::temp_dir("managed-block-matches-stale-duplicate");
+        let profile = temp_root.join(".shellrc");
+        let expected = ManagedBlock {
+            start_marker: "# >>> shellcomp bash tool >>>".to_owned(),
+            end_marker: "# <<< shellcomp bash tool <<<".to_owned(),
+            body: "source '/tmp/tool'".to_owned(),
+        };
+        let stale = ManagedBlock {
+            start_marker: expected.start_marker.clone(),
+            end_marker: expected.end_marker.clone(),
+            body: "source '/tmp/old-tool'".to_owned(),
+        };
+        fs::write(&profile, format!("{}{}", expected.render(), stale.render()))
+            .expect("profile should be writable");
+
+        assert!(!matches(&profile, &expected).expect("match check should succeed"));
+    }
+
+    #[test]
+    fn matches_rejects_duplicate_matching_blocks() {
+        let temp_root = crate::tests::temp_dir("managed-block-matches-duplicate");
+        let profile = temp_root.join(".shellrc");
+        let block = ManagedBlock {
+            start_marker: "# >>> shellcomp bash tool >>>".to_owned(),
+            end_marker: "# <<< shellcomp bash tool <<<".to_owned(),
+            body: "source '/tmp/tool'".to_owned(),
+        };
+        fs::write(&profile, format!("{}{}", block.render(), block.render()))
+            .expect("profile should be writable");
+
+        assert!(!matches(&profile, &block).expect("match check should succeed"));
+    }
+
+    #[test]
     fn remove_all_is_atomic_when_later_block_is_malformed() {
         let temp_root = crate::tests::temp_dir("managed-block-remove-all-atomic");
         let profile = temp_root.join(".shellrc");
@@ -488,5 +525,29 @@ mod tests {
         assert!(rendered.contains(&legacy.start_marker));
         assert!(rendered.contains("source '/tmp/bad'"));
         assert!(!rendered.contains("source '/tmp/tool'"));
+    }
+
+    #[test]
+    fn migrate_blocks_reports_created_when_shellcomp_block_is_added_to_existing_profile() {
+        let temp_root = crate::tests::temp_dir("managed-block-migrate-created");
+        let profile = temp_root.join(".shellrc");
+        let legacy = ManagedBlock {
+            start_marker: "# >>> legacy >>>".to_owned(),
+            end_marker: "# <<< legacy <<<".to_owned(),
+            body: "source '/tmp/legacy'".to_owned(),
+        };
+        let managed = ManagedBlock {
+            start_marker: "# >>> shellcomp bash tool >>>".to_owned(),
+            end_marker: "# <<< shellcomp bash tool <<<".to_owned(),
+            body: "source '/tmp/tool'".to_owned(),
+        };
+        fs::write(&profile, legacy.render()).expect("profile should be writable");
+
+        let (legacy_change, managed_change) =
+            migrate_blocks(&profile, std::slice::from_ref(&legacy), &managed)
+                .expect("migration should succeed");
+
+        assert_eq!(legacy_change, FileChange::Removed);
+        assert_eq!(managed_change, FileChange::Created);
     }
 }
