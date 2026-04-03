@@ -1,3 +1,8 @@
+## [0.1.8] - 2026-04-03
+
+### ⚙️ Miscellaneous Tasks
+
+- Release shellcomp version 0.1.8
 ## [0.1.7] - 2026-04-03
 
 ### 🐛 Bug Fixes
