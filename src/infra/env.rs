@@ -34,7 +34,21 @@ impl Environment {
 
     #[cfg(test)]
     pub(crate) fn test() -> Self {
-        Self::default()
+        let mut env = Self {
+            use_real_path_lookups: false,
+            ..Self::default()
+        };
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "ZDOTDIR",
+            "BASH_COMPLETION_VERSINFO",
+        ] {
+            env.overrides.insert(key.to_owned(), None);
+        }
+        env
     }
 
     #[cfg(test)]

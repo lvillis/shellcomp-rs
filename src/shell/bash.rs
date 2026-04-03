@@ -634,9 +634,14 @@ mod tests {
 
     #[test]
     fn loader_status_is_present_but_unwired_when_only_loader_file_exists() {
+        let temp_root = crate::tests::temp_dir("bash-loader-present-but-unwired");
+        let home = temp_root.join("home");
+        fs::create_dir_all(&home).expect("home should be creatable");
         let env = Environment::test()
+            .with_var("HOME", &home)
             .without_var("BASH_COMPLETION_VERSINFO")
-            .with_existing_path("/usr/share/bash-completion/bash_completion");
+            .with_existing_path("/usr/share/bash-completion/bash_completion")
+            .without_real_path_lookups();
         let status = loader_status(&env).expect("status should resolve");
 
         assert_eq!(status, LoaderStatus::PresentButUnwired);
