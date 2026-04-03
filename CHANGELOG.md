@@ -1,8 +1,17 @@
+## [0.1.7] - 2026-04-03
+
+### 🐛 Bug Fixes
+
+- *(test)* Stop shell tests from reading host dotfiles
 ## [0.1.6] - 2026-04-03
 
 ### 🐛 Bug Fixes
 
 - Harden shell activation handling and refresh clap integration docs
+
+### ⚙️ Miscellaneous Tasks
+
+- Release shellcomp version 0.1.6
 ## [0.1.5] - 2026-04-02
 
 ### 🚀 Features
