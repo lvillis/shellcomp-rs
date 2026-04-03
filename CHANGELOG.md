@@ -1,8 +1,17 @@
+## [0.1.6] - 2026-04-03
+
+### 🐛 Bug Fixes
+
+- Harden shell activation handling and refresh clap integration docs
 ## [0.1.5] - 2026-04-02
 
 ### 🚀 Features
 
 - Expand completion deployment and harden shell activation
+
+### ⚙️ Miscellaneous Tasks
+
+- Release shellcomp version 0.1.5
 ## [0.1.4] - 2026-04-02
 
 ### 🚀 Features
