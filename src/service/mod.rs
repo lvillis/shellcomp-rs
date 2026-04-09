@@ -11,6 +11,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::infra::{env::Environment, paths};
@@ -121,6 +122,7 @@ pub(crate) fn with_operation_observation<T>(
     run: impl FnOnce() -> Result<T>,
     result_target_path: impl Fn(&T) -> Option<PathBuf>,
 ) -> Result<T> {
+    let started_at = Instant::now();
     publish_operation_event(OperationEvent {
         operation,
         phase: OperationEventPhase::Started,
@@ -130,6 +132,7 @@ pub(crate) fn with_operation_observation<T>(
         target_path: planned_target_path.map(Path::to_path_buf),
         error_code: None,
         retryable: false,
+        duration_ms: None,
     });
 
     match run() {
@@ -143,6 +146,7 @@ pub(crate) fn with_operation_observation<T>(
                 target_path: result_target_path(&result),
                 error_code: None,
                 retryable: false,
+                duration_ms: Some(started_at.elapsed().as_millis()),
             });
             Ok(result)
         }
@@ -160,6 +164,7 @@ pub(crate) fn with_operation_observation<T>(
                     .or_else(|| planned_target_path.map(Path::to_path_buf)),
                 error_code,
                 retryable,
+                duration_ms: Some(started_at.elapsed().as_millis()),
             });
             Err(error)
         }
@@ -249,7 +254,21 @@ pub(crate) fn validate_target_path(path: &Path) -> Result<()> {
                     reason: "target path must not be a symbolic link",
                 });
             }
+            Ok(metadata) if !metadata.is_dir() && candidate == path => {}
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(Error::InvalidTargetPath {
+                    path: path.to_path_buf(),
+                    reason: "target path parent is not a directory",
+                });
+            }
             Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotADirectory => {
+                // `NotADirectory` can occur when an ancestor segment is not a real directory.
+                return Err(Error::InvalidTargetPath {
+                    path: path.to_path_buf(),
+                    reason: "target path parent is not a directory",
+                });
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(Error::io("inspect path", candidate, error));
@@ -455,6 +474,7 @@ pub(crate) fn failure_with_status(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::sync::mpsc;
     use std::sync::{
         Arc,
@@ -464,8 +484,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::tests::temp_dir;
+    use crate::{Error, InstallRequest, Shell};
 
-    use super::with_operation_lock;
+    use super::{install, validate_target_path, with_operation_event_hook, with_operation_lock};
 
     #[test]
     fn operation_lock_serializes_threads_for_same_target_path() {
@@ -528,5 +549,114 @@ mod tests {
         let _thread_entered = thread_entered;
 
         handle.join().expect("thread should finish");
+    }
+
+    #[test]
+    fn operation_events_capture_duration_for_success() {
+        let home = temp_dir("operation-observation-success").join("home");
+        let env = crate::infra::env::Environment::test()
+            .with_var("HOME", &home)
+            .with_var("XDG_DATA_HOME", home.join("data"))
+            .without_real_path_lookups();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+
+        with_operation_event_hook(
+            Some(Arc::new(move |event| {
+                let mut events = observed.lock().expect("event buffer should be usable");
+                events.push(event.clone());
+            })),
+            || {
+                let report = install::execute(
+                    &env,
+                    InstallRequest {
+                        shell: Shell::Bash,
+                        program_name: "tool",
+                        script: b"complete -F _tool tool\n",
+                        path_override: None,
+                    },
+                )
+                .expect("install should succeed");
+
+                assert_eq!(report.shell, Shell::Bash);
+            },
+        );
+
+        let events = events.lock().expect("events should be readable");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, crate::model::OperationEventPhase::Started);
+        assert_eq!(events[0].duration_ms, None);
+        assert_eq!(
+            events[1].phase,
+            crate::model::OperationEventPhase::Succeeded
+        );
+        assert!(events[1].duration_ms.is_some());
+        assert_eq!(events[0].trace_id, events[1].trace_id);
+    }
+
+    #[test]
+    fn operation_events_capture_error_code_for_failures() {
+        let env = crate::infra::env::Environment::test()
+            .without_var("HOME")
+            .without_var("XDG_DATA_HOME")
+            .without_real_path_lookups();
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_hook = Arc::clone(&observed);
+
+        let result = {
+            with_operation_event_hook(
+                Some(Arc::new(move |event| {
+                    let mut events = observed_hook.lock().expect("event buffer should be usable");
+                    events.push(event.clone());
+                })),
+                || {
+                    install::execute(
+                        &env,
+                        InstallRequest {
+                            shell: Shell::Bash,
+                            program_name: "tool",
+                            script: b"complete -F _tool tool\n",
+                            path_override: None,
+                        },
+                    )
+                },
+            )
+        };
+
+        let error = result.expect_err("install should fail when HOME is unavailable");
+        let report = error.into_failure().expect("failure should be structured");
+        assert_eq!(report.kind, crate::FailureKind::MissingHome);
+
+        let events = observed.lock().expect("events should be readable");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, crate::model::OperationEventPhase::Started);
+        assert_eq!(events[1].phase, crate::model::OperationEventPhase::Failed);
+        assert_eq!(events[1].error_code, Some("shellcomp.missing_home"));
+        assert_eq!(events[1].retryable, false);
+        assert!(events[1].duration_ms.is_some());
+        assert_eq!(events[0].trace_id, events[1].trace_id);
+    }
+
+    #[test]
+    fn validate_target_path_rejects_parent_file_path() {
+        let temp = temp_dir("validate-target-parent-file");
+        let home = temp.join("home");
+        std::fs::write(&home, "block").expect(".home target file should be created");
+        let error = validate_target_path(&home.join("tool")).expect_err("validation should fail");
+        assert!(
+            matches!(error, Error::InvalidTargetPath { reason, .. } if reason == "target path parent is not a directory"),
+            "unexpected validation error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_target_path_accepts_existing_target_file() {
+        let temp = temp_dir("validate-target-existing-file");
+        let target = temp.join("tool.bash");
+        std::fs::write(&target, "complete -F _tool tool\n")
+            .expect(".bashrc target file should be created");
+        validate_target_path(&target).expect("existing file target path should pass validation");
     }
 }

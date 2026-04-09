@@ -179,6 +179,11 @@ pub struct OperationEvent {
     pub error_code: Option<&'static str>,
     /// Whether a retry is expected to help for this failure.
     pub retryable: bool,
+    /// Elapsed duration in milliseconds from operation start for terminal phases.
+    ///
+    /// This field is omitted for `Started` events and populated for `Succeeded` /
+    /// `Failed` events.
+    pub duration_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
