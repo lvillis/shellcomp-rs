@@ -6,8 +6,9 @@ use crate::model::{
     ActivationPolicy, ActivationReport, Availability, FailureKind, Operation, Shell,
 };
 use crate::service::{
-    FailureContext, failure, home_env_hint, manual_activation_report, missing_completion_next_step,
-    validate_target_path, zsh_target_is_autoloadable,
+    FailureContext, default_target_path_matches, failure, home_env_hint, manual_activation_report,
+    missing_completion_next_step, resolve_default_target_path, validate_target_path,
+    zsh_target_is_autoloadable,
 };
 use crate::{Error, shell};
 
@@ -17,7 +18,7 @@ pub(crate) fn execute(
     program_name: &str,
 ) -> Result<ActivationReport> {
     paths::validate_program_name(program_name)?;
-    let target_path = paths::default_install_path(env, &shell, program_name)
+    let target_path = resolve_default_target_path(env, &shell, program_name)
         .map_err(|error| map_resolve_error(env, &shell, error))?;
     shell::detect_default(env, &shell, program_name, &target_path)
         .map_err(|error| map_detect_error(env, &shell, &target_path, error))
@@ -102,9 +103,7 @@ fn path_matches_default_target(
     program_name: &str,
     target_path: &Path,
 ) -> bool {
-    paths::default_install_path(env, shell, program_name)
-        .map(|default_path| default_path == target_path)
-        .unwrap_or(false)
+    default_target_path_matches(env, shell, program_name, target_path)
 }
 
 fn manual_custom_detection_report(
@@ -164,6 +163,23 @@ fn map_resolve_error(env: &Environment, shell: &Shell, error: Error) -> Error {
                 "Set {} for the current process so shellcomp can resolve the default managed path.",
                 home_env_hint(env, shell)
             )),
+        ),
+        Error::InvalidTargetPath { path, reason } => failure(
+            FailureContext {
+                operation: Operation::DetectActivation,
+                shell,
+                target_path: Some(&path),
+                affected_locations: vec![path.clone()],
+                kind: FailureKind::DefaultPathUnavailable,
+            },
+            format!(
+                "The managed default completion path `{}` is invalid: {reason}.",
+                path.display()
+            ),
+            Some(
+                "Set HOME, XDG_DATA_HOME, XDG_CONFIG_HOME, or ZDOTDIR to an absolute, normalized path."
+                    .to_owned(),
+            ),
         ),
         Error::UnsupportedShell(unsupported) => failure(
             FailureContext {
@@ -349,6 +365,20 @@ mod tests {
 
         let report = crate::tests::assert_structural_failure(error, "detect");
         assert_eq!(report.kind, crate::FailureKind::MissingHome);
+    }
+
+    #[test]
+    fn detect_rejects_relative_default_target_path_from_environment() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/home")
+            .with_var("XDG_DATA_HOME", "relative-cache")
+            .without_real_path_lookups();
+
+        let error = execute(&env, Shell::Bash, "tool").expect_err("detect should fail");
+
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.kind, crate::FailureKind::DefaultPathUnavailable);
+        assert!(report.reason.contains("managed default completion path"));
     }
 
     #[test]

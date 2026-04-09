@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::error::{Error, Result};
-use crate::infra::env::Environment;
+use crate::infra::{env::Environment, paths};
 use crate::model::{
     ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
     FailureReport, FileChange, Operation, Shell,
@@ -54,6 +54,34 @@ fn with_trace_scope<R>(f: impl FnOnce(u64) -> R) -> R {
 
 pub(crate) fn with_operation_trace<R>(f: impl FnOnce(u64) -> R) -> R {
     with_trace_scope(f)
+}
+
+pub(crate) fn resolve_default_target_path(
+    env: &Environment,
+    shell: &Shell,
+    program_name: &str,
+) -> Result<PathBuf> {
+    let target_path = paths::default_install_path(env, shell, program_name)?;
+    validate_target_path(&target_path)?;
+    Ok(target_path)
+}
+
+pub(crate) fn default_target_path_if_valid(
+    env: &Environment,
+    shell: &Shell,
+    program_name: &str,
+) -> Option<PathBuf> {
+    resolve_default_target_path(env, shell, program_name).ok()
+}
+
+pub(crate) fn default_target_path_matches(
+    env: &Environment,
+    shell: &Shell,
+    program_name: &str,
+    target_path: &Path,
+) -> bool {
+    default_target_path_if_valid(env, shell, program_name)
+        .is_some_and(|default_path| default_path == target_path)
 }
 
 fn active_trace_id() -> u64 {

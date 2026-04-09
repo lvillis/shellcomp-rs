@@ -7,8 +7,9 @@ use crate::model::{
     InstallReport, InstallRequest, Operation, Shell,
 };
 use crate::service::{
-    FailureContext, FailureStatus, failure, failure_with_status, home_env_hint,
-    manual_activation_report, push_unique, validate_target_path, zsh_target_is_autoloadable,
+    FailureContext, FailureStatus, default_target_path_matches, failure, failure_with_status,
+    home_env_hint, manual_activation_report, push_unique, resolve_default_target_path,
+    validate_target_path, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -129,9 +130,7 @@ fn target_matches_default(
     program_name: &str,
     target_path: &Path,
 ) -> bool {
-    paths::default_install_path(env, shell, program_name)
-        .map(|default_path| default_path == target_path)
-        .unwrap_or(false)
+    default_target_path_matches(env, shell, program_name, target_path)
 }
 
 fn legacy_activation_policy(
@@ -161,11 +160,13 @@ fn resolve_target_path(env: &Environment, request: &InstallRequest<'_>) -> Resul
             }
             Ok(path.clone())
         }
-        None => paths::default_install_path(env, &request.shell, request.program_name),
+        None => resolve_default_target_path(env, &request.shell, request.program_name),
     }
 }
 
 fn map_resolve_error(env: &Environment, request: &InstallRequest<'_>, error: Error) -> Error {
+    let uses_default_target = request.path_override.is_none();
+
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -209,9 +210,20 @@ fn map_resolve_error(env: &Environment, request: &InstallRequest<'_>, error: Err
                 shell: &request.shell,
                 target_path: Some(&path),
                 affected_locations: vec![path.clone()],
-                kind: FailureKind::InvalidTargetPath,
+                kind: if uses_default_target {
+                    FailureKind::DefaultPathUnavailable
+                } else {
+                    FailureKind::InvalidTargetPath
+                },
             },
-            format!("The requested install path `{}` is invalid: {reason}.", path.display()),
+            if uses_default_target {
+                format!("The managed default install path `{}` is invalid: {reason}.", path.display())
+            } else {
+                format!(
+                    "The requested install path `{}` is invalid: {reason}.",
+                    path.display()
+                )
+            },
             Some(
                 "Choose an absolute, non-symlink, normalized custom target path with an existing parent directory."
                     .to_owned(),
@@ -621,6 +633,29 @@ mod tests {
             error,
             crate::Error::Failure(report) if report.kind == crate::FailureKind::MissingHome
         ));
+    }
+
+    #[test]
+    fn install_rejects_relative_default_target_path_from_environment() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/home")
+            .with_var("XDG_DATA_HOME", "relative-cache")
+            .without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: None,
+            },
+        )
+        .expect_err("install should fail with invalid default path");
+
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::DefaultPathUnavailable);
+        assert!(report.reason.contains("managed default install path"));
     }
 
     #[test]

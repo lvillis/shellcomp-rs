@@ -6,8 +6,8 @@ use crate::model::{
     FailureKind, MigrateManagedBlocksReport, MigrateManagedBlocksRequest, Operation,
 };
 use crate::service::{
-    FailureContext, failure, home_env_hint, push_unique, validate_target_path,
-    zsh_target_is_autoloadable,
+    FailureContext, failure, home_env_hint, push_unique, resolve_default_target_path,
+    validate_target_path, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -58,7 +58,7 @@ fn resolve_target_path(
             }
             Ok(path.clone())
         }
-        None => paths::default_install_path(env, &request.shell, request.program_name),
+        None => resolve_default_target_path(env, &request.shell, request.program_name),
     }
 }
 
@@ -67,6 +67,8 @@ fn map_resolve_error(
     request: &MigrateManagedBlocksRequest<'_>,
     error: Error,
 ) -> Error {
+    let uses_default_target = request.path_override.is_none();
+
     match error {
         Error::MissingHome => failure(
             FailureContext {
@@ -110,12 +112,20 @@ fn map_resolve_error(
                 shell: &request.shell,
                 target_path: Some(&path),
                 affected_locations: vec![path.clone()],
-                kind: FailureKind::InvalidTargetPath,
+                kind: if uses_default_target {
+                    FailureKind::DefaultPathUnavailable
+                } else {
+                    FailureKind::InvalidTargetPath
+                },
             },
-            format!(
-                "The requested migration path `{}` is invalid: {reason}.",
-                path.display()
-            ),
+            if uses_default_target {
+                format!(
+                    "The managed default completion path `{}` is invalid: {reason}.",
+                    path.display()
+                )
+            } else {
+                format!("The requested migration path `{}` is invalid: {reason}.", path.display())
+            },
             Some(
                 "Choose an absolute, non-symlink, normalized migration target path with an existing parent directory."
                     .to_owned(),
@@ -369,6 +379,29 @@ mod tests {
         assert_eq!(report.operation, Operation::MigrateManagedBlocks);
         assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
         assert_eq!(report.target_path, Some(target));
+    }
+
+    #[test]
+    fn migrate_rejects_relative_default_target_path_from_environment() {
+        let env = Environment::test()
+            .with_var("HOME", "/tmp/home")
+            .with_var("XDG_DATA_HOME", "relative-cache")
+            .without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            MigrateManagedBlocksRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                path_override: None,
+                legacy_blocks: Vec::new(),
+            },
+        )
+        .expect_err("migrate should fail with invalid default path");
+
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.kind, crate::FailureKind::DefaultPathUnavailable);
+        assert!(report.reason.contains("managed default completion path"));
     }
 
     #[cfg(unix)]

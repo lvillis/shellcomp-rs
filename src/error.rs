@@ -79,6 +79,40 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns a stable machine-readable error code.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::EmptyProgramName => "shellcomp.empty_program_name",
+            Self::InvalidProgramName { .. } => "shellcomp.invalid_program_name",
+            Self::MissingHome => "shellcomp.missing_home",
+            Self::UnsupportedShell(_) => "shellcomp.unsupported_shell",
+            Self::PathHasNoParent { .. } => "shellcomp.invalid_target_path",
+            Self::InvalidTargetPath { .. } => "shellcomp.invalid_target_path",
+            Self::NonUtf8Path { .. } => "shellcomp.invalid_target_path",
+            Self::InvalidUtf8File { .. } => "shellcomp.invalid_target_file",
+            Self::ManagedBlockMissingEnd { .. } => "shellcomp.profile_corrupted",
+            Self::Failure(report) => report.error_code(),
+            Self::Io { .. } => "shellcomp.io_error",
+        }
+    }
+
+    /// Returns whether a retry may succeed with changed environment or timing.
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            Self::Failure(report) => report.is_retryable(),
+            Self::Io { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Returns the operation-scoped trace id when this is a structured failure.
+    pub fn trace_id(&self) -> Option<u64> {
+        match self {
+            Self::Failure(report) => Some(report.trace_id),
+            _ => None,
+        }
+    }
+
     pub(crate) fn io(action: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             action,
@@ -360,6 +394,41 @@ mod tests {
             )
         );
         assert_eq!(error.location(), None);
+    }
+
+    #[test]
+    fn error_helpers_expose_stable_code_retryability_and_trace() {
+        let report = FailureReport {
+            operation: Operation::Install,
+            shell: Shell::Bash,
+            target_path: Some(PathBuf::from("/tmp/tool")),
+            affected_locations: vec![PathBuf::from("/tmp/tool")],
+            kind: FailureKind::CompletionFileUnreadable,
+            file_change: None,
+            activation: None,
+            cleanup: None,
+            reason: "write failure".to_owned(),
+            next_step: Some("retry after fixing permissions".to_owned()),
+            trace_id: 99,
+        };
+
+        let error = Error::failure(report);
+
+        assert_eq!(
+            error.error_code(),
+            FailureKind::CompletionFileUnreadable.code()
+        );
+        assert!(error.is_retryable());
+        assert_eq!(error.trace_id(), Some(99));
+
+        let invalid_path = Error::InvalidTargetPath {
+            path: PathBuf::from("relative"),
+            reason: "target path must be absolute",
+        };
+
+        assert_eq!(invalid_path.error_code(), "shellcomp.invalid_target_path");
+        assert!(!invalid_path.is_retryable());
+        assert_eq!(invalid_path.trace_id(), None);
     }
 
     #[test]
