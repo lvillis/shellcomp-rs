@@ -7,7 +7,8 @@ use crate::model::{
 };
 use crate::service::{
     FailureContext, failure, home_env_hint, push_unique, resolve_default_target_path,
-    validate_target_path, zsh_target_is_autoloadable,
+    validate_target_path, with_operation_lock, with_operation_observation,
+    zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -15,35 +16,55 @@ pub(crate) fn execute(
     env: &Environment,
     request: MigrateManagedBlocksRequest<'_>,
 ) -> Result<MigrateManagedBlocksReport> {
-    paths::validate_program_name(request.program_name)?;
-    let target_path = resolve_target_path(env, &request)
-        .map_err(|error| map_resolve_error(env, &request, error))?;
-    validate_migration_target(&request, &target_path)?;
+    let shell = request.shell.clone();
+    let request = MigrateManagedBlocksRequest {
+        shell: shell.clone(),
+        program_name: request.program_name,
+        path_override: request.path_override.clone(),
+        legacy_blocks: request.legacy_blocks,
+    };
+    let program_name = request.program_name;
+    with_operation_observation(
+        Operation::MigrateManagedBlocks,
+        &shell,
+        program_name,
+        None,
+        || {
+            paths::validate_program_name(program_name)?;
+            let target_path = resolve_target_path(env, &request)
+                .map_err(|error| map_resolve_error(env, &request, error))?;
+            let lock_path = target_path.clone();
+            with_operation_lock(&lock_path, || {
+                validate_migration_target(&request, &target_path)?;
 
-    let mut affected_locations = Vec::new();
-    push_unique(&mut affected_locations, target_path.clone());
+                let mut affected_locations = Vec::new();
+                push_unique(&mut affected_locations, target_path.clone());
 
-    let outcome = shell::migrate_managed_blocks(
-        env,
-        &request.shell,
-        request.program_name,
-        &target_path,
-        &request.legacy_blocks,
+                let outcome = shell::migrate_managed_blocks(
+                    env,
+                    &request.shell,
+                    program_name,
+                    &target_path,
+                    &request.legacy_blocks,
+                )
+                .map_err(|error| map_migration_error(env, &request, &target_path, error))?;
+
+                for path in outcome.affected_locations {
+                    push_unique(&mut affected_locations, path);
+                }
+
+                Ok(MigrateManagedBlocksReport {
+                    shell: request.shell,
+                    target_path,
+                    location: outcome.location,
+                    legacy_change: outcome.legacy_change,
+                    managed_change: outcome.managed_change,
+                    affected_locations,
+                })
+            })
+        },
+        |report| Some(report.target_path.clone()),
     )
-    .map_err(|error| map_migration_error(env, &request, &target_path, error))?;
-
-    for path in outcome.affected_locations {
-        push_unique(&mut affected_locations, path);
-    }
-
-    Ok(MigrateManagedBlocksReport {
-        shell: request.shell,
-        target_path,
-        location: outcome.location,
-        legacy_change: outcome.legacy_change,
-        managed_change: outcome.managed_change,
-        affected_locations,
-    })
 }
 
 fn resolve_target_path(

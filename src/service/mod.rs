@@ -3,23 +3,31 @@ pub(crate) mod install;
 pub(crate) mod migrate;
 pub(crate) mod uninstall;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::infra::{env::Environment, paths};
 use crate::model::{
     ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
-    FailureReport, FileChange, Operation, Shell,
+    FailureReport, FileChange, Operation, OperationEvent, OperationEventPhase, Shell,
 };
+
+type OperationEventHook = Arc<dyn Fn(&OperationEvent) + Send + Sync>;
+type TargetPathLocks = HashMap<PathBuf, Arc<Mutex<()>>>;
 
 thread_local! {
     static OPERATION_TRACE_ID: Cell<u64> = const { Cell::new(0) };
+    static OPERATION_EVENT_HOOK: RefCell<Option<OperationEventHook>> = const { RefCell::new(None) };
 }
 
+static OPERATION_LOCKS: OnceLock<Mutex<TargetPathLocks>> = OnceLock::new();
 static NEXT_OPERATION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_trace_id() -> u64 {
@@ -54,6 +62,124 @@ fn with_trace_scope<R>(f: impl FnOnce(u64) -> R) -> R {
 
 pub(crate) fn with_operation_trace<R>(f: impl FnOnce(u64) -> R) -> R {
     with_trace_scope(f)
+}
+
+pub(crate) fn with_operation_event_hook<R>(
+    hook: Option<OperationEventHook>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct OperationEventHookScope {
+        previous: Option<OperationEventHook>,
+    }
+
+    impl Drop for OperationEventHookScope {
+        fn drop(&mut self) {
+            OPERATION_EVENT_HOOK.with(|slot| {
+                *slot.borrow_mut() = self.previous.take();
+            });
+        }
+    }
+
+    let previous = OPERATION_EVENT_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        std::mem::replace(&mut *slot, hook)
+    });
+    let _scope = OperationEventHookScope { previous };
+    f()
+}
+
+fn operation_event_scope() -> &'static Mutex<TargetPathLocks> {
+    OPERATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_for_target_path(target_path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = operation_event_scope()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let key = target_path.to_path_buf();
+    match locks.entry(key) {
+        Entry::Occupied(entry) => entry.get().clone(),
+        Entry::Vacant(entry) => {
+            let mutex = Arc::new(Mutex::new(()));
+            entry.insert(mutex.clone());
+            mutex
+        }
+    }
+}
+
+pub(crate) fn with_operation_lock<R>(target_path: &Path, f: impl FnOnce() -> R) -> R {
+    let lock = lock_for_target_path(target_path);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    f()
+}
+
+pub(crate) fn with_operation_observation<T>(
+    operation: Operation,
+    shell: &Shell,
+    program_name: &str,
+    planned_target_path: Option<&Path>,
+    run: impl FnOnce() -> Result<T>,
+    result_target_path: impl Fn(&T) -> Option<PathBuf>,
+) -> Result<T> {
+    publish_operation_event(OperationEvent {
+        operation,
+        phase: OperationEventPhase::Started,
+        shell: shell.clone(),
+        program_name: program_name.to_owned(),
+        trace_id: active_trace_id(),
+        target_path: planned_target_path.map(Path::to_path_buf),
+        error_code: None,
+        retryable: false,
+    });
+
+    match run() {
+        Ok(result) => {
+            publish_operation_event(OperationEvent {
+                operation,
+                phase: OperationEventPhase::Succeeded,
+                shell: shell.clone(),
+                program_name: program_name.to_owned(),
+                trace_id: active_trace_id(),
+                target_path: result_target_path(&result),
+                error_code: None,
+                retryable: false,
+            });
+            Ok(result)
+        }
+        Err(error) => {
+            let (error_code, retryable) = operation_error_event_info(&error);
+            publish_operation_event(OperationEvent {
+                operation,
+                phase: OperationEventPhase::Failed,
+                shell: shell.clone(),
+                program_name: program_name.to_owned(),
+                trace_id: active_trace_id(),
+                target_path: error
+                    .location()
+                    .map(Path::to_path_buf)
+                    .or_else(|| planned_target_path.map(Path::to_path_buf)),
+                error_code,
+                retryable,
+            });
+            Err(error)
+        }
+    }
+}
+
+fn operation_error_event_info(error: &Error) -> (Option<&'static str>, bool) {
+    if let Error::Failure(report) = error {
+        (Some(report.error_code()), report.is_retryable())
+    } else {
+        (Some(error.error_code()), error.is_retryable())
+    }
+}
+
+fn publish_operation_event(event: OperationEvent) {
+    OPERATION_EVENT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(&event);
+        }
+    });
 }
 
 pub(crate) fn resolve_default_target_path(
@@ -324,4 +450,83 @@ pub(crate) fn failure_with_status(
         next_step,
         trace_id: active_trace_id(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crate::tests::temp_dir;
+
+    use super::with_operation_lock;
+
+    #[test]
+    fn operation_lock_serializes_threads_for_same_target_path() {
+        let target = temp_dir("operation-lock").join("tool");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel::<PathBuf>();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let critical = Arc::new(AtomicBool::new(false));
+
+        let handle = {
+            let target = target.clone();
+            let entered_tx = entered_tx.clone();
+            let critical = Arc::clone(&critical);
+            let ready_rx = ready_rx;
+            let go_rx = go_rx;
+            let attempt_tx = attempt_tx;
+            thread::spawn(move || {
+                ready_rx.recv().expect("thread should receive start signal");
+                go_rx.recv().expect("thread should wait for go signal");
+                attempt_tx
+                    .send(target.clone())
+                    .expect("thread should report lock attempt");
+                let entered = Instant::now();
+                with_operation_lock(&target, || {
+                    critical.store(true, Ordering::SeqCst);
+                    entered_tx
+                        .send(entered)
+                        .expect("entered timestamp should be sent");
+                    thread::sleep(Duration::from_millis(20));
+                    critical.store(false, Ordering::SeqCst);
+                });
+            })
+        };
+
+        with_operation_lock(&target, || {
+            ready_tx
+                .send(())
+                .expect("thread should be signaled while lock is held");
+            go_tx
+                .send(())
+                .expect("thread should be released after main lock is acquired");
+            let thread_target = attempt_rx
+                .recv()
+                .expect("thread should attempt lock while main holds lock");
+            assert_eq!(
+                thread_target, target,
+                "thread should attempt lock for same target"
+            );
+            assert!(
+                !critical.load(Ordering::SeqCst),
+                "thread should not execute critical section while main lock is held",
+            );
+            thread::sleep(Duration::from_millis(120));
+        });
+
+        let thread_entered = entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread should acquire lock after main");
+        let _thread_entered = thread_entered;
+
+        handle.join().expect("thread should finish");
+    }
 }

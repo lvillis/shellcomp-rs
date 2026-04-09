@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use shellcomp::{
     ActivationMode, ActivationPolicy, Availability, Error, FailureKind, FileChange, InstallRequest,
-    LegacyManagedBlock, MigrateManagedBlocksRequest, Shell, UninstallRequest, default_install_path,
-    detect_activation_at_path, install, install_with_policy, migrate_managed_blocks, uninstall,
-    uninstall_with_policy,
+    LegacyManagedBlock, MigrateManagedBlocksRequest, Operation, OperationEventPhase, Shell,
+    UninstallRequest, default_install_path, detect_activation_at_path, install,
+    install_with_policy, migrate_managed_blocks, uninstall, uninstall_with_policy,
+    with_operation_events,
 };
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -131,6 +132,106 @@ fn default_install_path_rejects_unsupported_shell_via_public_api() {
         error,
         Error::UnsupportedShell(Shell::Other(value)) if value == "xonsh"
     ));
+}
+
+#[test]
+fn default_install_path_rejects_invalid_default_env_values() {
+    let _guard = env_lock();
+    let temp_root = temp_dir("default-path-invalid");
+    let old_home = std::env::var_os("HOME");
+    let old_xdg_data = std::env::var_os("XDG_DATA_HOME");
+
+    let home = temp_root.join("home");
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", "relative-cache");
+    }
+
+    let error = default_install_path(Shell::Bash, "demo")
+        .expect_err("relative XDG_DATA_HOME should be rejected");
+    assert_eq!(error.error_code(), FailureKind::InvalidTargetPath.code());
+
+    unsafe {
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_xdg_data {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+}
+
+#[test]
+fn operation_events_capture_install_lifecycle() {
+    let temp_root = temp_dir("install-events");
+    let target = temp_root.join("demo.bash");
+    let script = b"complete -F _demo demo\n";
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let report = with_operation_events(
+        Some({
+            let events = Arc::clone(&events);
+            move |event: &shellcomp::OperationEvent| {
+                events.lock().unwrap().push(event.clone());
+            }
+        }),
+        || {
+            install(InstallRequest {
+                shell: Shell::Bash,
+                program_name: "demo",
+                script,
+                path_override: Some(target.clone()),
+            })
+            .expect("install should succeed")
+        },
+    );
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].phase, OperationEventPhase::Started);
+    assert_eq!(events[1].phase, OperationEventPhase::Succeeded);
+    assert_eq!(events[0].trace_id, events[1].trace_id);
+    assert_eq!(events[0].operation, Operation::Install);
+    assert_eq!(events[0].program_name, "demo");
+    assert_eq!(events[1].target_path, Some(target.clone()));
+    assert_eq!(report.target_path, target);
+}
+
+#[test]
+fn operation_events_capture_failure_metadata() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let error = with_operation_events(
+        Some({
+            let events = Arc::clone(&events);
+            move |event: &shellcomp::OperationEvent| {
+                events.lock().unwrap().push(event.clone());
+            }
+        }),
+        || {
+            uninstall(UninstallRequest {
+                shell: Shell::Bash,
+                program_name: "demo",
+                path_override: Some(PathBuf::from("relative-path")),
+            })
+        },
+    )
+    .expect_err("with_operation_events should preserve failure");
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].phase, OperationEventPhase::Started);
+    assert_eq!(events[1].phase, OperationEventPhase::Failed);
+    assert_eq!(events[1].operation, Operation::Uninstall);
+    assert_eq!(
+        events[1].error_code,
+        Some(FailureKind::InvalidTargetPath.code())
+    );
+    assert!(!events[1].retryable);
+    let report = error.as_failure().expect("failure expected");
+    assert_eq!(report.kind, FailureKind::InvalidTargetPath);
+    assert_eq!(events[1].target_path, Some(PathBuf::from("relative-path")));
 }
 
 #[test]

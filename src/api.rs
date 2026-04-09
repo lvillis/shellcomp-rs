@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::infra::{env::Environment, paths};
+use crate::infra::env::Environment;
 use crate::model::{
     ActivationPolicy, InstallReport, InstallRequest, MigrateManagedBlocksReport,
-    MigrateManagedBlocksRequest, RemoveReport, Shell, UninstallRequest,
+    MigrateManagedBlocksRequest, OperationEvent, RemoveReport, Shell, UninstallRequest,
 };
-use crate::service::{detect, install, migrate, uninstall, with_operation_trace};
+use crate::service::{
+    detect, install, migrate, resolve_default_target_path, uninstall, with_operation_event_hook,
+    with_operation_trace,
+};
 
 /// Returns the default managed install path for a shell and binary name.
 ///
@@ -38,7 +41,23 @@ use crate::service::{detect, install, migrate, uninstall, with_operation_trace};
 /// # Ok::<(), shellcomp::Error>(())
 /// ```
 pub fn default_install_path(shell: Shell, program_name: &str) -> Result<PathBuf> {
-    paths::default_install_path(&Environment::system(), &shell, program_name)
+    resolve_default_target_path(&Environment::system(), &shell, program_name)
+}
+
+/// Runs a closure with a temporary operation-level hook.
+///
+/// The hook receives lifecycle events for install, uninstall, detect and migration operations.
+/// Events include `Started`, `Succeeded`, and `Failed` phases with `trace_id`, `error_code`, and
+/// `retryable` metadata when available.
+pub fn with_operation_events<R>(
+    hook: Option<impl Fn(&OperationEvent) + Send + Sync + 'static>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let hook = hook.map(|hook| {
+        let hook: std::sync::Arc<dyn Fn(&OperationEvent) + Send + Sync> = std::sync::Arc::new(hook);
+        hook
+    });
+    with_operation_event_hook(hook, f)
 }
 
 /// Installs a completion script and returns a structured report.

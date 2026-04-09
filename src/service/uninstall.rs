@@ -9,7 +9,7 @@ use crate::model::{
 use crate::service::{
     FailureContext, FailureStatus, default_target_path_matches, failure, failure_with_status,
     home_env_hint, push_unique, resolve_default_target_path, validate_target_path,
-    zsh_target_is_autoloadable,
+    with_operation_lock, with_operation_observation, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -29,45 +29,73 @@ pub(crate) fn execute_with_policy(
     request: UninstallRequest<'_>,
     activation_policy: ActivationPolicy,
 ) -> Result<RemoveReport> {
-    paths::validate_program_name(request.program_name)?;
-    let target_path = resolve_target_path(env, &request)
-        .map_err(|error| map_resolve_error(env, &request, error))?;
-    let file_change = fs::remove_file_if_exists(&target_path)
-        .map_err(|error| map_file_error(&request, &target_path, error))?;
-
-    let mut affected_locations = Vec::new();
-    push_unique(&mut affected_locations, target_path.clone());
-
-    let cleanup = if should_use_shell_backend(env, &request, activation_policy, &target_path) {
-        let outcome =
-            shell::uninstall_default(env, &request.shell, request.program_name, &target_path)
-                .map_err(|error| {
-                    map_cleanup_error(env, &request, &target_path, file_change, error)
-                })?;
-        for path in outcome.affected_locations {
-            push_unique(&mut affected_locations, path);
-        }
-        outcome.cleanup
-    } else {
-        CleanupReport {
-            mode: crate::ActivationMode::Manual,
-            change: crate::FileChange::Absent,
-            location: None,
-            reason: Some(
-                "Managed activation cleanup was skipped because the activation policy is manual."
-                    .to_owned(),
-            ),
-            next_step: None,
-        }
+    let shell = request.shell.clone();
+    let request = UninstallRequest {
+        shell: shell.clone(),
+        program_name: request.program_name,
+        path_override: request.path_override.clone(),
     };
+    let program_name = request.program_name;
+    with_operation_observation(
+        Operation::Uninstall,
+        &shell,
+        program_name,
+        None,
+        || {
+            paths::validate_program_name(program_name)?;
+            let target_path = resolve_target_path(env, &request)
+                .map_err(|error| map_resolve_error(env, &request, error))?;
+            let lock_path = target_path.clone();
+            with_operation_lock(&lock_path, || {
+                let file_change = fs::remove_file_if_exists(&target_path)
+                    .map_err(|error| map_file_error(&request, &target_path, error))?;
 
-    Ok(RemoveReport {
-        shell: request.shell,
-        target_path,
-        file_change,
-        cleanup,
-        affected_locations,
-    })
+                let mut affected_locations = Vec::new();
+                push_unique(&mut affected_locations, target_path.clone());
+
+                let cleanup = if should_use_shell_backend(
+                    env,
+                    &request,
+                    activation_policy,
+                    &target_path,
+                ) {
+                    let outcome = shell::uninstall_default(
+                        env,
+                        &request.shell,
+                        request.program_name,
+                        &target_path,
+                    )
+                    .map_err(|error| {
+                        map_cleanup_error(env, &request, &target_path, file_change, error)
+                    })?;
+                    for path in outcome.affected_locations {
+                        push_unique(&mut affected_locations, path);
+                    }
+                    outcome.cleanup
+                } else {
+                    CleanupReport {
+                            mode: crate::ActivationMode::Manual,
+                            change: crate::FileChange::Absent,
+                            location: None,
+                            reason: Some(
+                                "Managed activation cleanup was skipped because the activation policy is manual."
+                                    .to_owned(),
+                            ),
+                            next_step: None,
+                        }
+                };
+
+                Ok(RemoveReport {
+                    shell: request.shell,
+                    target_path,
+                    file_change,
+                    cleanup,
+                    affected_locations,
+                })
+            })
+        },
+        |report| Some(report.target_path.clone()),
+    )
 }
 
 fn should_use_shell_backend(

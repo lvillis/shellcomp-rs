@@ -9,7 +9,8 @@ use crate::model::{
 use crate::service::{
     FailureContext, FailureStatus, default_target_path_matches, failure, failure_with_status,
     home_env_hint, manual_activation_report, push_unique, resolve_default_target_path,
-    validate_target_path, zsh_target_is_autoloadable,
+    validate_target_path, with_operation_lock, with_operation_observation,
+    zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -29,36 +30,73 @@ pub(crate) fn execute_with_policy(
     request: InstallRequest<'_>,
     activation_policy: ActivationPolicy,
 ) -> Result<InstallReport> {
-    paths::validate_program_name(request.program_name)?;
-    let target_path = resolve_target_path(env, &request)
-        .map_err(|error| map_resolve_error(env, &request, error))?;
-    let file_change = fs::write_if_changed(&target_path, request.script)
-        .map_err(|error| map_write_error(&request, &target_path, error))?;
-
-    let mut affected_locations = Vec::new();
-    push_unique(&mut affected_locations, target_path.clone());
-
-    let activation = if should_use_shell_backend(env, &request, activation_policy, &target_path) {
-        let outcome =
-            shell::install_default(env, &request.shell, request.program_name, &target_path)
-                .map_err(|error| {
-                    map_activation_error(env, &request.shell, &target_path, file_change, error)
-                })?;
-        for path in outcome.affected_locations {
-            push_unique(&mut affected_locations, path);
-        }
-        outcome.report
-    } else {
-        manual_policy_activation(env, &request, activation_policy, &target_path, file_change)?
+    let shell = request.shell.clone();
+    let request = InstallRequest {
+        shell: shell.clone(),
+        program_name: request.program_name,
+        script: request.script,
+        path_override: request.path_override.clone(),
     };
+    let program_name = request.program_name;
+    with_operation_observation(
+        Operation::Install,
+        &shell,
+        program_name,
+        None,
+        || {
+            paths::validate_program_name(program_name)?;
+            let target_path = resolve_target_path(env, &request)
+                .map_err(|error| map_resolve_error(env, &request, error))?;
+            let lock_path = target_path.clone();
+            with_operation_lock(&lock_path, || {
+                let file_change = fs::write_if_changed(&target_path, request.script)
+                    .map_err(|error| map_write_error(&request, &target_path, error))?;
 
-    Ok(InstallReport {
-        shell: request.shell,
-        target_path,
-        file_change,
-        activation,
-        affected_locations,
-    })
+                let mut affected_locations = Vec::new();
+                push_unique(&mut affected_locations, target_path.clone());
+
+                let activation =
+                    if should_use_shell_backend(env, &request, activation_policy, &target_path) {
+                        let outcome = shell::install_default(
+                            env,
+                            &request.shell,
+                            request.program_name,
+                            &target_path,
+                        )
+                        .map_err(|error| {
+                            map_activation_error(
+                                env,
+                                &request.shell,
+                                &target_path,
+                                file_change,
+                                error,
+                            )
+                        })?;
+                        for path in outcome.affected_locations {
+                            push_unique(&mut affected_locations, path);
+                        }
+                        outcome.report
+                    } else {
+                        manual_policy_activation(
+                            env,
+                            &request,
+                            activation_policy,
+                            &target_path,
+                            file_change,
+                        )?
+                    };
+
+                Ok(InstallReport {
+                    shell: request.shell,
+                    target_path,
+                    file_change,
+                    activation,
+                    affected_locations,
+                })
+            })
+        },
+        |report| Some(report.target_path.clone()),
+    )
 }
 
 fn should_use_shell_backend(

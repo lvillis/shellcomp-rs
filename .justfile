@@ -1,5 +1,11 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+patch:
+  cargo release patch --no-publish --execute
+
+publish:
+  cargo publish
+
 ci:
   cargo fmt --all --check
   cargo check --all-targets --all-features
@@ -11,6 +17,3 @@ ci:
   cargo doc --no-deps --all-features
   RUSTDOCFLAGS='--cfg docsrs' cargo +nightly doc --all-features --no-deps
   cargo publish --dry-run --allow-dirty
-
-patch:
-  cargo release patch --no-publish --execute

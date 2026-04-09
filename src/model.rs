@@ -150,6 +150,38 @@ pub enum Operation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// High-level lifecycle phase for operation-level observability hooks.
+pub enum OperationEventPhase {
+    /// The operation started.
+    Started,
+    /// The operation finished successfully.
+    Succeeded,
+    /// The operation finished with an error.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Structured event emitted for operation-level observability hooks.
+pub struct OperationEvent {
+    /// Operation being executed.
+    pub operation: Operation,
+    /// Event lifecycle phase.
+    pub phase: OperationEventPhase,
+    /// Target shell.
+    pub shell: Shell,
+    /// Requested program name.
+    pub program_name: String,
+    /// Scoped operation identifier visible in structured failures.
+    pub trace_id: u64,
+    /// Primary completion path involved in the operation, when available.
+    pub target_path: Option<PathBuf>,
+    /// Stable machine-readable code when the operation ended in failure.
+    pub error_code: Option<&'static str>,
+    /// Whether a retry is expected to help for this failure.
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Stable failure kinds for recoverable operational errors.
 ///
 /// [`crate::Error::Failure`] wraps a [`FailureReport`] carrying one of these kinds so callers can

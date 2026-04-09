@@ -227,11 +227,12 @@ pub mod clap_complete {
 pub use api::{
     default_install_path, detect_activation, detect_activation_at_path, install,
     install_with_policy, migrate_managed_blocks, uninstall, uninstall_with_policy,
+    with_operation_events,
 };
 pub use error::{Error, Result};
 pub use model::{
     ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
     FailureReport, FileChange, InstallReport, InstallRequest, LegacyManagedBlock,
-    MigrateManagedBlocksReport, MigrateManagedBlocksRequest, Operation, RemoveReport, Shell,
-    UninstallRequest,
+    MigrateManagedBlocksReport, MigrateManagedBlocksRequest, Operation, OperationEvent,
+    OperationEventPhase, RemoveReport, Shell, UninstallRequest,
 };

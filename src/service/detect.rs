@@ -8,7 +8,7 @@ use crate::model::{
 use crate::service::{
     FailureContext, default_target_path_matches, failure, home_env_hint, manual_activation_report,
     missing_completion_next_step, resolve_default_target_path, validate_target_path,
-    zsh_target_is_autoloadable,
+    with_operation_observation, zsh_target_is_autoloadable,
 };
 use crate::{Error, shell};
 
@@ -17,11 +17,21 @@ pub(crate) fn execute(
     shell: Shell,
     program_name: &str,
 ) -> Result<ActivationReport> {
-    paths::validate_program_name(program_name)?;
-    let target_path = resolve_default_target_path(env, &shell, program_name)
-        .map_err(|error| map_resolve_error(env, &shell, error))?;
-    shell::detect_default(env, &shell, program_name, &target_path)
-        .map_err(|error| map_detect_error(env, &shell, &target_path, error))
+    with_operation_observation(
+        Operation::DetectActivation,
+        &shell,
+        program_name,
+        None,
+        || {
+            paths::validate_program_name(program_name)?;
+            let target_path = resolve_default_target_path(env, &shell, program_name)
+                .map_err(|error| map_resolve_error(env, &shell, error))?;
+
+            shell::detect_default(env, &shell, program_name, &target_path)
+                .map_err(|error| map_detect_error(env, &shell, &target_path, error))
+        },
+        |report| report.location.clone(),
+    )
 }
 
 pub(crate) fn execute_at_path(
@@ -30,36 +40,53 @@ pub(crate) fn execute_at_path(
     program_name: &str,
     target_path: &Path,
 ) -> Result<ActivationReport> {
-    paths::validate_program_name(program_name)?;
-    validate_target_path(target_path)
-        .map_err(|error| map_detect_error(env, &shell, target_path, error))?;
-    match shell {
-        Shell::Fish => {
-            if path_matches_default_target(env, &Shell::Fish, program_name, target_path) {
-                shell::detect_default(env, &shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(env, &shell, target_path, error))
-            } else {
-                manual_custom_detection_report(&shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(env, &shell, target_path, error))
-            }
-        }
-        Shell::Bash => {
-            detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
-        }
-        Shell::Zsh => {
-            if !zsh_target_is_autoloadable(program_name, target_path) {
-                return manual_custom_detection_report(&shell, program_name, target_path)
-                    .map_err(|error| map_detect_error(env, &shell, target_path, error));
-            }
+    with_operation_observation(
+        Operation::DetectActivation,
+        &shell,
+        program_name,
+        Some(target_path),
+        || {
+            paths::validate_program_name(program_name)?;
+            validate_target_path(target_path)
+                .map_err(|error| map_detect_error(env, &shell, target_path, error))?;
+            match shell {
+                Shell::Fish => {
+                    if path_matches_default_target(env, &Shell::Fish, program_name, target_path) {
+                        shell::detect_default(env, &shell, program_name, target_path)
+                            .map_err(|error| map_detect_error(env, &shell, target_path, error))
+                    } else {
+                        manual_custom_detection_report(&shell, program_name, target_path)
+                            .map_err(|error| map_detect_error(env, &shell, target_path, error))
+                    }
+                }
+                Shell::Bash => {
+                    detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
+                }
+                Shell::Zsh => {
+                    if !zsh_target_is_autoloadable(program_name, target_path) {
+                        return manual_custom_detection_report(&shell, program_name, target_path)
+                            .map_err(|error| map_detect_error(env, &shell, target_path, error));
+                    }
 
-            detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
-        }
-        Shell::Powershell | Shell::Elvish => {
-            detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
-        }
-        _ => shell::detect_default(env, &shell, program_name, target_path)
-            .map_err(|error| map_detect_error(env, &shell, target_path, error)),
-    }
+                    detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
+                }
+                Shell::Powershell | Shell::Elvish => {
+                    detect_custom_path_with_managed_fallback(env, &shell, program_name, target_path)
+                }
+                _ => shell::detect_default(env, &shell, program_name, target_path)
+                    .map_err(|error| map_detect_error(env, &shell, target_path, error)),
+            }
+        },
+        |report| {
+            report.location.clone().or_else(|| {
+                if report.availability == Availability::ManualActionRequired {
+                    Some(target_path.to_path_buf())
+                } else {
+                    None
+                }
+            })
+        },
+    )
 }
 
 fn detect_custom_path_with_managed_fallback(
