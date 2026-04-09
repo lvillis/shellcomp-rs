@@ -84,6 +84,25 @@ impl Error {
         Self::Failure(Box::new(report))
     }
 
+    /// Returns `Some` when the error is [`Error::Failure`].
+    pub fn as_failure(&self) -> Option<&FailureReport> {
+        match self {
+            Self::Failure(report) => Some(report),
+            _ => None,
+        }
+    }
+
+    /// Converts a [`Error::Failure`] into a plain [`FailureReport`].
+    ///
+    /// This is useful when callers need stable, structured failure data and prefer not to
+    /// branch on internals in each match arm.
+    pub fn into_failure(self) -> Option<FailureReport> {
+        match self {
+            Self::Failure(report) => Some(*report),
+            _ => None,
+        }
+    }
+
     /// Returns the most relevant filesystem location for this error, when one exists.
     ///
     /// For [`Error::Failure`], this returns the report's primary `target_path`. Use

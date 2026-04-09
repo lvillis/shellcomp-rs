@@ -114,14 +114,12 @@ fn install_returns_structured_failure_for_path_without_parent() {
     })
     .expect_err("path without parent should fail");
 
-    match error {
-        Error::Failure(report) => {
-            assert_eq!(report.kind, FailureKind::InvalidTargetPath);
-            assert_eq!(report.target_path.as_deref(), Some(Path::new("/")));
-            assert_eq!(report.file_change, None);
-        }
-        other => panic!("unexpected error variant: {other}"),
-    }
+    let report = error
+        .as_failure()
+        .expect("path without parent should fail structurally");
+    assert_eq!(report.kind, FailureKind::InvalidTargetPath);
+    assert_eq!(report.target_path.as_deref(), Some(Path::new("/")));
+    assert_eq!(report.file_change, None);
 }
 
 #[test]

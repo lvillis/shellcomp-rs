@@ -111,26 +111,29 @@
 //! deployment API.
 //!
 //! ```no_run
-//! use clap::Parser;
-//! use shellcomp::{InstallRequest, install, render_clap_completion};
-//!
-//! #[derive(Parser)]
-//! struct Cli {
-//!     #[arg(long)]
-//!     verbose: bool,
-//! }
-//!
-//! let generator_shell = shellcomp::clap_complete::Shell::Zsh;
-//! let script = render_clap_completion::<Cli>(generator_shell, "demo")?;
-//! let report = install(InstallRequest {
-//!     shell: generator_shell.into(),
-//!     program_name: "demo",
-//!     script: &script,
-//!     path_override: None,
-//! })?;
-//!
-//! println!("installed to {}", report.target_path.display());
+//! # #[cfg(feature = "clap")]
+//! # fn install_zsh_completion() -> shellcomp::Result<()> {
+//! # use clap::Parser;
+//! # use shellcomp::{InstallRequest, install, render_clap_completion};
+//! #
+//! # #[derive(Parser)]
+//! # struct Cli {
+//! #     #[arg(long)]
+//! #     verbose: bool,
+//! # }
+//! #
+//! # let generator_shell = shellcomp::clap_complete::Shell::Zsh;
+//! # let script = render_clap_completion::<Cli>(generator_shell, "demo")?;
+//! # let report = install(InstallRequest {
+//! #     shell: generator_shell.into(),
+//! #     program_name: "demo",
+//! #     script: &script,
+//! #     path_override: None,
+//! # })?;
+//! #
+//! # println!("installed to {}", report.target_path.display());
 //! # Ok::<(), shellcomp::Error>(())
+//! # }
 //! ```
 //!
 //! # Custom Path Example
@@ -175,12 +178,10 @@
 //! })
 //! .expect_err("path without parent should fail structurally");
 //!
-//! match error {
-//!     Error::Failure(report) => {
-//!         assert_eq!(report.kind, FailureKind::InvalidTargetPath);
-//!     }
-//!     other => panic!("unexpected error: {other}"),
-//! }
+//! let report = error
+//!     .as_failure()
+//!     .expect("path without parent should fail structurally");
+//! assert_eq!(report.kind, FailureKind::InvalidTargetPath);
 //! ```
 //!
 //! Not every error becomes [`Error::Failure`]: immediate validation problems like

@@ -328,10 +328,8 @@ mod tests {
 
         let error = execute(&env, Shell::Zsh, "tool").expect_err("detect should fail");
 
-        assert!(matches!(
-            error,
-            crate::Error::Failure(report) if report.kind == crate::FailureKind::MissingHome
-        ));
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.kind, crate::FailureKind::MissingHome);
     }
 
     #[test]
@@ -344,19 +342,15 @@ mod tests {
 
         let error = execute(&env, Shell::Powershell, "tool").expect_err("detect should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::MissingHome);
-                assert!(report.reason.contains("HOME or USERPROFILE is not set"));
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains("HOME or USERPROFILE"))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.kind, crate::FailureKind::MissingHome);
+        assert!(report.reason.contains("HOME or USERPROFILE is not set"));
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains("HOME or USERPROFILE"))
+        );
     }
 
     #[test]
@@ -381,26 +375,22 @@ mod tests {
 
         let error = execute(&env, Shell::Zsh, "tool").expect_err("detect should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::DetectActivation);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-                assert_eq!(report.target_path, Some(completion_dir.join("_tool")));
-                assert!(
-                    report
-                        .affected_locations
-                        .iter()
-                        .any(|path| path.ends_with(".zshrc"))
-                );
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&zshrc.display().to_string()))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.operation, Operation::DetectActivation);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+        assert_eq!(report.target_path, Some(completion_dir.join("_tool")));
+        assert!(
+            report
+                .affected_locations
+                .iter()
+                .any(|path| path.ends_with(".zshrc"))
+        );
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(&zshrc.display().to_string()))
+        );
     }
 
     #[test]
@@ -421,19 +411,15 @@ mod tests {
 
         let error = execute(&env, Shell::Zsh, "tool").expect_err("detect should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::DetectActivation);
-                assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&zshrc.display().to_string()))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.operation, Operation::DetectActivation);
+        assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(&zshrc.display().to_string()))
+        );
     }
 
     #[test]
@@ -533,14 +519,10 @@ mod tests {
         let error =
             execute_at_path(&env, Shell::Bash, "tool", &target).expect_err("detect should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::DetectActivation);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-                assert_eq!(report.target_path, Some(target));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.operation, Operation::DetectActivation);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+        assert_eq!(report.target_path, Some(target));
     }
 
     #[test]
@@ -635,15 +617,11 @@ mod tests {
         let error = execute_at_path(&env, Shell::Fish, "tool", &target)
             .expect_err("detect should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::DetectActivation);
-                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
-                assert_eq!(report.target_path, Some(target));
-                assert!(report.next_step.is_some());
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.operation, Operation::DetectActivation);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
+        assert!(report.next_step.is_some());
     }
 
     #[test]

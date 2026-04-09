@@ -630,19 +630,15 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::MissingHome);
-                assert!(report.reason.contains("HOME or USERPROFILE is not set"));
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains("HOME or USERPROFILE"))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::MissingHome);
+        assert!(report.reason.contains("HOME or USERPROFILE is not set"));
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains("HOME or USERPROFILE"))
+        );
     }
 
     #[test]
@@ -669,28 +665,24 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
-                assert_eq!(report.file_change, Some(FileChange::Created));
-                let activation = report.activation.expect("activation context should exist");
-                assert_eq!(activation.mode, ActivationMode::Manual);
-                assert_eq!(activation.availability, Availability::ManualActionRequired);
-                assert!(
-                    report
-                        .affected_locations
-                        .iter()
-                        .any(|path| path.ends_with(".bashrc"))
-                );
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&bashrc.display().to_string()))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
+        assert_eq!(report.file_change, Some(FileChange::Created));
+        let activation = report.activation.expect("activation context should exist");
+        assert_eq!(activation.mode, ActivationMode::Manual);
+        assert_eq!(activation.availability, Availability::ManualActionRequired);
+        assert!(
+            report
+                .affected_locations
+                .iter()
+                .any(|path| path.ends_with(".bashrc"))
+        );
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(&bashrc.display().to_string()))
+        );
     }
 
     #[test]
@@ -717,28 +709,24 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
-                assert_eq!(report.file_change, Some(FileChange::Created));
-                let activation = report.activation.expect("activation context should exist");
-                assert_eq!(activation.mode, ActivationMode::Manual);
-                assert_eq!(activation.availability, Availability::ManualActionRequired);
-                assert!(
-                    report
-                        .affected_locations
-                        .iter()
-                        .any(|path| path.ends_with(".zshrc"))
-                );
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&zshrc.display().to_string()))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::ProfileUnavailable);
+        assert_eq!(report.file_change, Some(FileChange::Created));
+        let activation = report.activation.expect("activation context should exist");
+        assert_eq!(activation.mode, ActivationMode::Manual);
+        assert_eq!(activation.availability, Availability::ManualActionRequired);
+        assert!(
+            report
+                .affected_locations
+                .iter()
+                .any(|path| path.ends_with(".zshrc"))
+        );
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(&zshrc.display().to_string()))
+        );
     }
 
     #[test]
@@ -764,17 +752,12 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                let next_step = report.next_step.expect("next_step should exist");
-                assert!(next_step.contains("Source '"));
-                assert!(
-                    next_step
-                        .contains("home with space/.local/share/bash-completion/completions/tool")
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("Source '"));
+        assert!(
+            next_step.contains("home with space/.local/share/bash-completion/completions/tool")
+        );
     }
 
     #[test]
@@ -802,17 +785,10 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                let next_step = report.next_step.expect("next_step should exist");
-                assert!(next_step.contains(". '"));
-                assert!(
-                    next_step
-                        .contains("home with space/.local/share/powershell/completions/tool.ps1")
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains(". '"));
+        assert!(next_step.contains("home with space/.local/share/powershell/completions/tool.ps1"));
     }
 
     #[test]
@@ -839,15 +815,11 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                let next_step = report.next_step.expect("next_step should exist");
-                assert!(next_step.contains("'"));
-                assert!(next_step.contains("zdot dir/.zfunc"));
-                assert!(next_step.contains("fpath"));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("'"));
+        assert!(next_step.contains("zdot dir/.zfunc"));
+        assert!(next_step.contains("fpath"));
     }
 
     #[test]
@@ -874,16 +846,10 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                let next_step = report.next_step.expect("next_step should exist");
-                assert!(next_step.contains("eval (slurp < '"));
-                assert!(
-                    next_step.contains("home with space/.config/elvish/lib/shellcomp/tool.elv")
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains("eval (slurp < '"));
+        assert!(next_step.contains("home with space/.config/elvish/lib/shellcomp/tool.elv"));
     }
 
     #[test]
@@ -904,15 +870,11 @@ mod tests {
         )
         .expect_err("install should fail on unreadable target");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::CompletionFileUnreadable);
-                let next_step = report.next_step.expect("next_step should exist");
-                assert!(next_step.contains(&format!(". {}", powershell_quote(&target))));
-                assert!(!next_step.contains("<path>"));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::CompletionFileUnreadable);
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains(&format!(". {}", powershell_quote(&target))));
+        assert!(!next_step.contains("<path>"));
     }
 
     #[test]
@@ -933,15 +895,11 @@ mod tests {
         )
         .expect_err("install should fail on unreadable target");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::CompletionFileUnreadable);
-                let next_step = report.next_step.expect("next_step should exist");
-                assert!(next_step.contains(&format!("eval (slurp < {})", elvish_quote(&target))));
-                assert!(!next_step.contains("<path>"));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::CompletionFileUnreadable);
+        let next_step = report.next_step.expect("next_step should exist");
+        assert!(next_step.contains(&format!("eval (slurp < {})", elvish_quote(&target))));
+        assert!(!next_step.contains("<path>"));
     }
 
     #[test]
@@ -970,30 +928,26 @@ mod tests {
         )
         .expect_err("install should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::Install);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-                assert_eq!(report.target_path, Some(completion_dir.join("tool")));
-                assert_eq!(report.file_change, Some(FileChange::Created));
-                let activation = report.activation.expect("activation context should exist");
-                assert_eq!(activation.mode, ActivationMode::Manual);
-                assert_eq!(activation.availability, Availability::ManualActionRequired);
-                assert!(
-                    report
-                        .affected_locations
-                        .iter()
-                        .any(|path| path.ends_with(".bashrc"))
-                );
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&bashrc.display().to_string()))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.operation, Operation::Install);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+        assert_eq!(report.target_path, Some(completion_dir.join("tool")));
+        assert_eq!(report.file_change, Some(FileChange::Created));
+        let activation = report.activation.expect("activation context should exist");
+        assert_eq!(activation.mode, ActivationMode::Manual);
+        assert_eq!(activation.availability, Availability::ManualActionRequired);
+        assert!(
+            report
+                .affected_locations
+                .iter()
+                .any(|path| path.ends_with(".bashrc"))
+        );
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(&bashrc.display().to_string()))
+        );
     }
 
     #[test]
@@ -1317,14 +1271,10 @@ mod tests {
         )
         .expect_err("install should fail structurally");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
-                assert_eq!(report.file_change, Some(FileChange::Created));
-                assert_eq!(report.target_path, Some(target));
-                assert!(report.next_step.is_some());
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.file_change, Some(FileChange::Created));
+        assert_eq!(report.target_path, Some(target));
+        assert!(report.next_step.is_some());
     }
 }

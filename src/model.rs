@@ -394,13 +394,11 @@ pub struct ActivationReport {
 /// })
 /// .expect_err("path without parent should fail");
 ///
-/// match error {
-///     Error::Failure(report) => {
-///         assert_eq!(report.kind, FailureKind::InvalidTargetPath);
-///         assert!(report.reason.contains("does not have a parent directory"));
-///     }
-///     other => panic!("unexpected error: {other}"),
-/// }
+/// let report = error
+///     .as_failure()
+///     .expect("path without parent should fail");
+/// assert_eq!(report.kind, FailureKind::InvalidTargetPath);
+/// assert!(report.reason.contains("does not have a parent directory"));
 /// ```
 pub struct FailureReport {
     /// Operation that failed.

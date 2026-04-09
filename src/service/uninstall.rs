@@ -473,28 +473,24 @@ mod tests {
         )
         .expect_err("uninstall should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::Uninstall);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-                assert_eq!(report.target_path, Some(completion_dir.join("tool")));
-                assert!(report.cleanup.is_none());
-                assert!(
-                    report
-                        .affected_locations
-                        .iter()
-                        .any(|path| path.ends_with(".bashrc"))
-                );
-                assert!(report.next_step.is_some());
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(".bashrc"))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "uninstall");
+        assert_eq!(report.operation, Operation::Uninstall);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+        assert_eq!(report.target_path, Some(completion_dir.join("tool")));
+        assert!(report.cleanup.is_none());
+        assert!(
+            report
+                .affected_locations
+                .iter()
+                .any(|path| path.ends_with(".bashrc"))
+        );
+        assert!(report.next_step.is_some());
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(".bashrc"))
+        );
     }
 
     #[test]
@@ -527,16 +523,12 @@ mod tests {
         )
         .expect_err("uninstall should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::Uninstall);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-                assert_eq!(report.target_path, Some(completion_path.clone()));
-                assert_eq!(report.file_change, Some(FileChange::Removed));
-                assert!(!completion_path.exists());
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "uninstall");
+        assert_eq!(report.operation, Operation::Uninstall);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+        assert_eq!(report.target_path, Some(completion_path.clone()));
+        assert_eq!(report.file_change, Some(FileChange::Removed));
+        assert!(!completion_path.exists());
     }
 
     #[test]

@@ -327,13 +327,9 @@ mod tests {
         )
         .expect_err("migration should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::MigrateManagedBlocks);
-                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.operation, Operation::MigrateManagedBlocks);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
     }
 
     #[test]
@@ -367,14 +363,10 @@ mod tests {
         )
         .expect_err("migration should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::MigrateManagedBlocks);
-                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
-                assert_eq!(report.target_path, Some(target));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.operation, Operation::MigrateManagedBlocks);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
 
         let rendered = fs::read_to_string(zshrc).expect(".zshrc should remain readable");
         assert!(rendered.contains("legacy zsh"));
@@ -416,14 +408,10 @@ mod tests {
         )
         .expect_err("migration should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::MigrateManagedBlocks);
-                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
-                assert_eq!(report.target_path, Some(target));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.operation, Operation::MigrateManagedBlocks);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
 
         let rendered = fs::read_to_string(bashrc).expect(".bashrc should remain readable");
         assert!(rendered.contains("legacy bash"));
@@ -467,14 +455,10 @@ mod tests {
         )
         .expect_err("migration should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::MigrateManagedBlocks);
-                assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
-                assert_eq!(report.target_path, Some(target));
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.operation, Operation::MigrateManagedBlocks);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
 
         let rendered = fs::read_to_string(zshrc).expect(".zshrc should remain readable");
         assert!(rendered.contains("legacy zsh"));
@@ -517,13 +501,9 @@ mod tests {
         )
         .expect_err("migration should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::MigrateManagedBlocks);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.operation, Operation::MigrateManagedBlocks);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
 
         let rendered = fs::read_to_string(bashrc).expect(".bashrc should remain readable");
         assert!(rendered.contains("legacy one"));
@@ -561,19 +541,15 @@ mod tests {
         )
         .expect_err("migration should fail");
 
-        match error {
-            crate::Error::Failure(report) => {
-                assert_eq!(report.operation, Operation::MigrateManagedBlocks);
-                assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
-                assert!(
-                    report
-                        .next_step
-                        .as_deref()
-                        .is_some_and(|text| text.contains(".bashrc"))
-                );
-            }
-            other => panic!("unexpected error variant: {other}"),
-        }
+        let report = crate::tests::assert_structural_failure(error, "migrate");
+        assert_eq!(report.operation, Operation::MigrateManagedBlocks);
+        assert_eq!(report.kind, crate::FailureKind::ProfileCorrupted);
+        assert!(
+            report
+                .next_step
+                .as_deref()
+                .is_some_and(|text| text.contains(".bashrc"))
+        );
 
         let rendered = fs::read_to_string(bashrc).expect(".bashrc should remain readable");
         assert!(rendered.contains("legacy bash"));

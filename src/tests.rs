@@ -10,3 +10,14 @@ pub(crate) fn temp_dir(label: &str) -> PathBuf {
     std::fs::create_dir_all(&path).expect("temp dir should be creatable");
     path
 }
+
+pub(crate) fn assert_structural_failure(
+    error: crate::Error,
+    context: &str,
+) -> crate::FailureReport {
+    assert!(
+        error.as_failure().is_some(),
+        "{context}: expected structured failure, got {error:?}"
+    );
+    error.into_failure().expect("expected structured failure")
+}
