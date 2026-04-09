@@ -1,3 +1,24 @@
+## [0.1.12] - 2026-04-09
+
+### 🚀 Features
+
+- *(service)* Add trace IDs and strict target-path validation
+- *(service)* Add operation events and per-target path locking
+
+### 🐛 Bug Fixes
+
+- *(service)* Harden default target-path handling and failure observability
+- *(service)* Capture operation durations and harden target-path validation
+- Ci
+
+### 🚜 Refactor
+
+- *(tests)* Unify structured failure assertions
+## [0.1.11] - 2026-04-03
+
+### ⚙️ Miscellaneous Tasks
+
+- Release shellcomp version 0.1.11
 ## [0.1.10] - 2026-04-03
 
 ### ⚙️ Miscellaneous Tasks
