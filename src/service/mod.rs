@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(events[0].phase, crate::model::OperationEventPhase::Started);
         assert_eq!(events[1].phase, crate::model::OperationEventPhase::Failed);
         assert_eq!(events[1].error_code, Some("shellcomp.missing_home"));
-        assert_eq!(events[1].retryable, false);
+        assert!(!events[1].retryable);
         assert!(events[1].duration_ms.is_some());
         assert_eq!(events[0].trace_id, events[1].trace_id);
     }
