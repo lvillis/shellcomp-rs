@@ -32,6 +32,13 @@ pub enum Error {
         /// The invalid path.
         path: PathBuf,
     },
+    /// A target path failed explicit validation for security or correctness reasons.
+    InvalidTargetPath {
+        /// The rejected path.
+        path: PathBuf,
+        /// Stable reason for failure classification.
+        reason: &'static str,
+    },
     /// A path could not be represented as UTF-8 for shell wiring purposes.
     NonUtf8Path {
         /// The path that could not be encoded.
@@ -122,6 +129,7 @@ impl Error {
     pub fn location(&self) -> Option<&Path> {
         match self {
             Self::PathHasNoParent { path }
+            | Self::InvalidTargetPath { path, .. }
             | Self::NonUtf8Path { path }
             | Self::InvalidUtf8File { path }
             | Self::Io { path, .. } => Some(path.as_path()),
@@ -163,6 +171,7 @@ impl Error {
             Self::PathHasNoParent { .. } => {
                 Some("The provided path does not have a parent directory.")
             }
+            Self::InvalidTargetPath { reason, .. } => Some(reason),
             Self::NonUtf8Path { .. } => Some(
                 "The path cannot be represented safely in shell startup wiring because it is not valid UTF-8.",
             ),
@@ -201,6 +210,25 @@ impl Error {
             Self::PathHasNoParent { .. } => Some(
                 "Pass a file path with a real parent directory, or create the parent directory before calling shellcomp.",
             ),
+            Self::InvalidTargetPath { reason, .. } if *reason == "target path must be absolute" => {
+                Some("Pass an absolute path so shellcomp can apply safe path validation reliably.")
+            }
+            Self::InvalidTargetPath { reason, .. }
+                if *reason == "target path must not be a symbolic link" =>
+            {
+                Some(
+                    "Choose a path in a non-symlink directory and avoid symlink completion targets.",
+                )
+            }
+            Self::InvalidTargetPath { reason, .. } => Some(match *reason {
+                "target path must be normalized" => {
+                    "Pass a normalized absolute path without `.` or `..` segments."
+                }
+                "target path parent must be an existing directory" => {
+                    "Create the parent directory before calling shellcomp."
+                }
+                _ => "Use an explicit non-relative, non-symlink target path.",
+            }),
             Self::InvalidProgramName { .. } => Some(
                 "Rename the binary or pass a sanitized program name that only uses ASCII letters, digits, `.`, `_`, and `-`.",
             ),
@@ -230,6 +258,9 @@ impl Display for Error {
                     "path `{}` does not have a parent directory",
                     path.display()
                 )
+            }
+            Self::InvalidTargetPath { path, reason } => {
+                write!(f, "target path `{}` is invalid: {reason}", path.display())
             }
             Self::NonUtf8Path { path } => {
                 write!(
@@ -298,6 +329,7 @@ mod tests {
             cleanup: None,
             reason: "Could not update the managed Bash startup block.".to_owned(),
             next_step: Some("edit your shell profile manually".to_owned()),
+            trace_id: 123,
         });
 
         assert_eq!(error.location(), Some(PathBuf::from("/tmp/tool").as_path()));
@@ -306,6 +338,7 @@ mod tests {
             Some("Could not update the managed Bash startup block.")
         );
         assert_eq!(error.next_step(), Some("edit your shell profile manually"));
+        assert_eq!(error.as_failure().unwrap().trace_id, 123);
     }
 
     #[test]

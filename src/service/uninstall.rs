@@ -8,7 +8,7 @@ use crate::model::{
 };
 use crate::service::{
     FailureContext, FailureStatus, failure, failure_with_status, home_env_hint, push_unique,
-    zsh_target_is_autoloadable,
+    validate_target_path, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -127,6 +127,7 @@ fn legacy_activation_policy(
 fn resolve_target_path(env: &Environment, request: &UninstallRequest<'_>) -> Result<PathBuf> {
     match &request.path_override {
         Some(path) => {
+            validate_target_path(path)?;
             if path.parent().is_none() {
                 return Err(Error::PathHasNoParent { path: path.clone() });
             }
@@ -171,6 +172,23 @@ fn map_resolve_error(env: &Environment, request: &UninstallRequest<'_>, error: E
             ),
             Some(
                 "Pass the exact file path that should be removed, including a real parent directory."
+                    .to_owned(),
+            ),
+        ),
+        Error::InvalidTargetPath { path, reason } => failure(
+            FailureContext {
+                operation: Operation::Uninstall,
+                shell: &request.shell,
+                target_path: Some(&path),
+                affected_locations: vec![path.clone()],
+                kind: FailureKind::InvalidTargetPath,
+            },
+            format!(
+                "The requested uninstall path `{}` is invalid: {reason}.",
+                path.display()
+            ),
+            Some(
+                "Choose an absolute, non-symlink, normalized custom target path with an existing parent directory."
                     .to_owned(),
             ),
         ),
@@ -652,6 +670,53 @@ mod tests {
         assert_eq!(report.cleanup.mode, crate::ActivationMode::NativeDirectory);
         assert_eq!(report.cleanup.change, FileChange::Absent);
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn uninstall_rejects_relative_target_path_override() {
+        let target = std::path::PathBuf::from("tool.bash");
+
+        let error = execute(
+            &Environment::test(),
+            UninstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                path_override: Some(target.clone()),
+            },
+        )
+        .expect_err("uninstall should fail");
+
+        let report = crate::tests::assert_structural_failure(error, "uninstall");
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_rejects_symlink_path_segments_in_target_override() {
+        use std::os::unix::fs::symlink;
+
+        let temp_root = crate::tests::temp_dir("uninstall-symlink-path");
+        let real_dir = temp_root.join("real");
+        let link_dir = temp_root.join("link");
+        let target = link_dir.join("tool.bash");
+
+        std::fs::create_dir_all(&real_dir).expect("real dir should be creatable");
+        symlink(&real_dir, &link_dir).expect("symlink should be created");
+
+        let error = execute(
+            &Environment::test(),
+            UninstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                path_override: Some(target.clone()),
+            },
+        )
+        .expect_err("uninstall should reject symlink path");
+
+        let report = crate::tests::assert_structural_failure(error, "uninstall");
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
     }
 
     #[test]

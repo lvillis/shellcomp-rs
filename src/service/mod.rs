@@ -3,7 +3,11 @@ pub(crate) mod install;
 pub(crate) mod migrate;
 pub(crate) mod uninstall;
 
-use std::path::{Path, PathBuf};
+use std::cell::Cell;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::error::{Error, Result};
 use crate::infra::env::Environment;
@@ -11,6 +15,108 @@ use crate::model::{
     ActivationMode, ActivationPolicy, ActivationReport, Availability, CleanupReport, FailureKind,
     FailureReport, FileChange, Operation, Shell,
 };
+
+thread_local! {
+    static OPERATION_TRACE_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+static NEXT_OPERATION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_trace_id() -> u64 {
+    NEXT_OPERATION_TRACE_ID.fetch_add(1, Relaxed)
+}
+
+struct TraceScope {
+    previous: u64,
+}
+
+impl Drop for TraceScope {
+    fn drop(&mut self) {
+        OPERATION_TRACE_ID.with(|slot| slot.set(self.previous));
+    }
+}
+
+fn with_trace_scope<R>(f: impl FnOnce(u64) -> R) -> R {
+    let (trace_id, previous) = OPERATION_TRACE_ID.with(|slot| {
+        let previous = slot.get();
+        let trace_id = if previous == 0 {
+            allocate_trace_id()
+        } else {
+            previous
+        };
+        slot.set(trace_id);
+        (trace_id, previous)
+    });
+
+    let _scope = TraceScope { previous };
+    f(trace_id)
+}
+
+pub(crate) fn with_operation_trace<R>(f: impl FnOnce(u64) -> R) -> R {
+    with_trace_scope(f)
+}
+
+fn active_trace_id() -> u64 {
+    OPERATION_TRACE_ID.with(|slot| {
+        let trace_id = slot.get();
+        if trace_id == 0 {
+            let fallback = allocate_trace_id();
+            slot.set(fallback);
+            fallback
+        } else {
+            trace_id
+        }
+    })
+}
+
+pub(crate) fn validate_target_path(path: &Path) -> Result<()> {
+    if path.is_relative() {
+        return Err(Error::InvalidTargetPath {
+            path: path.to_path_buf(),
+            reason: "target path must be absolute",
+        });
+    }
+
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(Error::InvalidTargetPath {
+            path: path.to_path_buf(),
+            reason: "target path must be normalized",
+        });
+    }
+
+    for candidate in path_ancestor_sequence(path) {
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::InvalidTargetPath {
+                    path: path.to_path_buf(),
+                    reason: "target path must not be a symbolic link",
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::io("inspect path", candidate, error));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn path_ancestor_sequence(path: &Path) -> Vec<PathBuf> {
+    let mut parts = Vec::new();
+    let mut current = Some(path);
+
+    while let Some(entry) = current {
+        parts.push(entry.to_path_buf());
+        current = entry.parent();
+    }
+
+    parts
+}
 
 pub(crate) fn manual_activation_report(
     shell: &Shell,
@@ -188,5 +294,6 @@ pub(crate) fn failure_with_status(
         cleanup: status.cleanup,
         reason: reason.into(),
         next_step,
+        trace_id: active_trace_id(),
     })
 }

@@ -8,7 +8,7 @@ use crate::model::{
 };
 use crate::service::{
     FailureContext, FailureStatus, failure, failure_with_status, home_env_hint,
-    manual_activation_report, push_unique, zsh_target_is_autoloadable,
+    manual_activation_report, push_unique, validate_target_path, zsh_target_is_autoloadable,
 };
 use crate::shell;
 
@@ -155,6 +155,7 @@ fn legacy_activation_policy(
 fn resolve_target_path(env: &Environment, request: &InstallRequest<'_>) -> Result<PathBuf> {
     match &request.path_override {
         Some(path) => {
+            validate_target_path(path)?;
             if path.parent().is_none() {
                 return Err(Error::PathHasNoParent { path: path.clone() });
             }
@@ -199,6 +200,20 @@ fn map_resolve_error(env: &Environment, request: &InstallRequest<'_>, error: Err
             ),
             Some(
                 "Pass a file path with a real parent directory, or create the parent directory first."
+                .to_owned(),
+            ),
+        ),
+        Error::InvalidTargetPath { path, reason } => failure(
+            FailureContext {
+                operation: Operation::Install,
+                shell: &request.shell,
+                target_path: Some(&path),
+                affected_locations: vec![path.clone()],
+                kind: FailureKind::InvalidTargetPath,
+            },
+            format!("The requested install path `{}` is invalid: {reason}.", path.display()),
+            Some(
+                "Choose an absolute, non-symlink, normalized custom target path with an existing parent directory."
                     .to_owned(),
             ),
         ),
@@ -1276,5 +1291,57 @@ mod tests {
         assert_eq!(report.file_change, Some(FileChange::Created));
         assert_eq!(report.target_path, Some(target));
         assert!(report.next_step.is_some());
+    }
+
+    #[test]
+    fn install_rejects_relative_target_path_override() {
+        let target = std::path::PathBuf::from("custom/tool.bash");
+        let env = Environment::test();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: Some(target),
+            },
+        )
+        .expect_err("install should fail structurally");
+
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert!(report.target_path.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_symlink_path_segments_in_target_override() {
+        use std::os::unix::fs::symlink;
+
+        let temp_root = crate::tests::temp_dir("install-symlink-path");
+        let real_dir = temp_root.join("real");
+        let link_dir = temp_root.join("link");
+        let target = link_dir.join("tool.bash");
+
+        std::fs::create_dir_all(&real_dir).expect("real dir should be creatable");
+        symlink(&real_dir, &link_dir).expect("symlink should be created");
+
+        let env = Environment::test().without_real_path_lookups();
+
+        let error = execute(
+            &env,
+            InstallRequest {
+                shell: Shell::Bash,
+                program_name: "tool",
+                script: b"complete -F _tool tool\n",
+                path_override: Some(target.clone()),
+            },
+        )
+        .expect_err("install should reject symlinked paths");
+
+        let report = crate::tests::assert_structural_failure(error, "install");
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
     }
 }

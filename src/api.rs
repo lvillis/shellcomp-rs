@@ -6,7 +6,7 @@ use crate::model::{
     ActivationPolicy, InstallReport, InstallRequest, MigrateManagedBlocksReport,
     MigrateManagedBlocksRequest, RemoveReport, Shell, UninstallRequest,
 };
-use crate::service::{detect, install, migrate, uninstall};
+use crate::service::{detect, install, migrate, uninstall, with_operation_trace};
 
 /// Returns the default managed install path for a shell and binary name.
 ///
@@ -75,7 +75,7 @@ pub fn default_install_path(shell: Shell, program_name: &str) -> Result<PathBuf>
 /// # Ok::<(), shellcomp::Error>(())
 /// ```
 pub fn install(request: InstallRequest<'_>) -> Result<InstallReport> {
-    install::execute(&Environment::system(), request)
+    with_operation_trace(|_| install::execute(&Environment::system(), request))
 }
 
 /// Installs a completion script with explicit activation intent.
@@ -107,7 +107,9 @@ pub fn install_with_policy(
     request: InstallRequest<'_>,
     activation_policy: ActivationPolicy,
 ) -> Result<InstallReport> {
-    install::execute_with_policy(&Environment::system(), request, activation_policy)
+    with_operation_trace(|_| {
+        install::execute_with_policy(&Environment::system(), request, activation_policy)
+    })
 }
 
 /// Removes a previously managed completion script and any managed activation wiring.
@@ -139,7 +141,7 @@ pub fn install_with_policy(
 /// # Ok::<(), shellcomp::Error>(())
 /// ```
 pub fn uninstall(request: UninstallRequest<'_>) -> Result<RemoveReport> {
-    uninstall::execute(&Environment::system(), request)
+    with_operation_trace(|_| uninstall::execute(&Environment::system(), request))
 }
 
 /// Removes a completion script with explicit activation cleanup intent.
@@ -150,7 +152,9 @@ pub fn uninstall_with_policy(
     request: UninstallRequest<'_>,
     activation_policy: ActivationPolicy,
 ) -> Result<RemoveReport> {
-    uninstall::execute_with_policy(&Environment::system(), request, activation_policy)
+    with_operation_trace(|_| {
+        uninstall::execute_with_policy(&Environment::system(), request, activation_policy)
+    })
 }
 
 /// Detects how a completion would be activated for the current environment.
@@ -176,7 +180,7 @@ pub fn uninstall_with_policy(
 /// # Ok::<(), shellcomp::Error>(())
 /// ```
 pub fn detect_activation(shell: Shell, program_name: &str) -> Result<crate::ActivationReport> {
-    detect::execute(&Environment::system(), shell, program_name)
+    with_operation_trace(|_| detect::execute(&Environment::system(), shell, program_name))
 }
 
 /// Detects activation state for an explicit completion file path.
@@ -189,7 +193,9 @@ pub fn detect_activation_at_path(
     program_name: &str,
     target_path: &Path,
 ) -> Result<crate::ActivationReport> {
-    detect::execute_at_path(&Environment::system(), shell, program_name, target_path)
+    with_operation_trace(|_| {
+        detect::execute_at_path(&Environment::system(), shell, program_name, target_path)
+    })
 }
 
 /// Removes caller-provided legacy managed markers and upserts the equivalent `shellcomp` block.
@@ -201,7 +207,7 @@ pub fn detect_activation_at_path(
 pub fn migrate_managed_blocks(
     request: MigrateManagedBlocksRequest<'_>,
 ) -> Result<MigrateManagedBlocksReport> {
-    migrate::execute(&Environment::system(), request)
+    with_operation_trace(|_| migrate::execute(&Environment::system(), request))
 }
 
 #[cfg(feature = "clap")]
@@ -254,7 +260,7 @@ pub fn render_clap_completion<T: clap::CommandFactory>(
 }
 
 #[cfg(all(test, feature = "clap"))]
-mod tests {
+mod clap_tests {
     use clap::Parser;
 
     use super::render_clap_completion;
@@ -293,5 +299,26 @@ mod tests {
             error,
             crate::Error::UnsupportedShell(Shell::Other(value)) if value == "xonsh"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{InstallRequest, install};
+
+    #[test]
+    fn api_surface_attaches_trace_id_to_structural_failure() {
+        let error = install(InstallRequest {
+            shell: crate::Shell::Bash,
+            program_name: "tool",
+            script: b"complete -F _tool tool\n",
+            path_override: Some(PathBuf::from("tool.bash")),
+        })
+        .expect_err("install should fail with validation error");
+
+        let report = crate::tests::assert_structural_failure(error, "api-install");
+        assert_ne!(report.trace_id, 0);
     }
 }

@@ -178,6 +178,32 @@ pub enum FailureKind {
     ProfileCorrupted,
 }
 
+impl FailureKind {
+    /// Returns a stable machine-readable code for monitoring and telemetry.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingHome => "shellcomp.missing_home",
+            Self::UnsupportedShell => "shellcomp.unsupported_shell",
+            Self::InvalidTargetPath => "shellcomp.invalid_target_path",
+            Self::DefaultPathUnavailable => "shellcomp.default_path_unavailable",
+            Self::CompletionTargetUnavailable => "shellcomp.completion_target_unavailable",
+            Self::CompletionFileUnreadable => "shellcomp.completion_file_unreadable",
+            Self::ProfileUnavailable => "shellcomp.profile_unavailable",
+            Self::ProfileCorrupted => "shellcomp.profile_corrupted",
+        }
+    }
+
+    /// Returns whether the kind is generally worth a retry with corrected environment or timing.
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::CompletionTargetUnavailable
+                | Self::CompletionFileUnreadable
+                | Self::ProfileUnavailable
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Input for a completion install operation.
 ///
@@ -432,4 +458,18 @@ pub struct FailureReport {
     pub reason: String,
     /// Suggested next step for recovery or manual completion.
     pub next_step: Option<String>,
+    /// Invocation-scoped id generated for error correlation.
+    pub trace_id: u64,
+}
+
+impl FailureReport {
+    /// Stable machine-readable error code for structured telemetry.
+    pub const fn error_code(&self) -> &'static str {
+        self.kind.code()
+    }
+
+    /// Returns whether the failure may succeed after environment correction or retry.
+    pub const fn is_retryable(&self) -> bool {
+        self.kind.is_retryable()
+    }
 }

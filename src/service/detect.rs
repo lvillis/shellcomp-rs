@@ -7,7 +7,7 @@ use crate::model::{
 };
 use crate::service::{
     FailureContext, failure, home_env_hint, manual_activation_report, missing_completion_next_step,
-    zsh_target_is_autoloadable,
+    validate_target_path, zsh_target_is_autoloadable,
 };
 use crate::{Error, shell};
 
@@ -30,6 +30,8 @@ pub(crate) fn execute_at_path(
     target_path: &Path,
 ) -> Result<ActivationReport> {
     paths::validate_program_name(program_name)?;
+    validate_target_path(target_path)
+        .map_err(|error| map_detect_error(env, &shell, target_path, error))?;
     match shell {
         Shell::Fish => {
             if path_matches_default_target(env, &Shell::Fish, program_name, target_path) {
@@ -239,6 +241,23 @@ fn map_detect_error(
             "The requested completion path could not be represented safely as UTF-8 for activation detection.",
             Some(
                 "Move the completion file to a UTF-8 path or choose a UTF-8 path before asking shellcomp to inspect activation."
+                    .to_owned(),
+            ),
+        ),
+        Error::InvalidTargetPath { path, reason } => failure(
+            FailureContext {
+                operation: Operation::DetectActivation,
+                shell,
+                target_path: Some(&path),
+                affected_locations: vec![target_path.to_path_buf(), path.clone()],
+                kind: FailureKind::InvalidTargetPath,
+            },
+            format!(
+                "The requested detection target `{}` is invalid: {reason}.",
+                path.display()
+            ),
+            Some(
+                "Choose an absolute, non-symlink, normalized custom target path for detection."
                     .to_owned(),
             ),
         ),
@@ -622,6 +641,48 @@ mod tests {
         assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
         assert_eq!(report.target_path, Some(target));
         assert!(report.next_step.is_some());
+    }
+
+    #[test]
+    fn detect_at_path_rejects_relative_target_path() {
+        let temp_root = crate::tests::temp_dir("detect-relative-target");
+        let env = Environment::test()
+            .with_var("HOME", temp_root.join("home"))
+            .without_real_path_lookups();
+
+        let error = execute_at_path(
+            &env,
+            Shell::Bash,
+            "tool",
+            std::path::Path::new("custom/tool.bash"),
+        )
+        .expect_err("detect_at_path should reject relative path");
+
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.operation, Operation::DetectActivation);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_at_path_rejects_symlink_path_segments() {
+        use std::os::unix::fs::symlink;
+
+        let temp_root = crate::tests::temp_dir("detect-symlink-target");
+        let real_dir = temp_root.join("real");
+        let link_dir = temp_root.join("link");
+        let target = link_dir.join("tool.bash");
+
+        std::fs::create_dir_all(&real_dir).expect("real dir should be creatable");
+        symlink(&real_dir, &link_dir).expect("symlink should be created");
+
+        let error = execute_at_path(&Environment::test(), Shell::Bash, "tool", &target)
+            .expect_err("detect_at_path should reject symlink path");
+
+        let report = crate::tests::assert_structural_failure(error, "detect");
+        assert_eq!(report.operation, Operation::DetectActivation);
+        assert_eq!(report.kind, crate::FailureKind::InvalidTargetPath);
+        assert_eq!(report.target_path, Some(target));
     }
 
     #[test]

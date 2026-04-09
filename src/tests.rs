@@ -16,8 +16,11 @@ pub(crate) fn assert_structural_failure(
     context: &str,
 ) -> crate::FailureReport {
     assert!(
-        error.as_failure().is_some(),
+        matches!(error, crate::Error::Failure(_)),
         "{context}: expected structured failure, got {error:?}"
     );
-    error.into_failure().expect("expected structured failure")
+    error
+        .as_failure()
+        .expect("expected structured failure")
+        .clone()
 }
