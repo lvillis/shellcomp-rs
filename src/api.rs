@@ -231,11 +231,28 @@ pub fn migrate_managed_blocks(
 
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+fn render_clap_completion_bytes(
+    shell: impl Into<Shell>,
+    bin_name: &str,
+    command: &mut clap::Command,
+) -> Result<Vec<u8>> {
+    use clap_complete::generate;
+
+    let generator = <clap_complete::Shell as TryFrom<Shell>>::try_from(shell.into())?;
+    let mut output = Vec::new();
+    generate(generator, command, bin_name, &mut output);
+    Ok(output)
+}
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 /// Renders a completion script from a `clap::CommandFactory` implementation.
 ///
 /// This helper is intentionally optional so the core crate does not require `clap`.
 /// It only renders script bytes; installation and activation are still handled by [`install`].
 /// The `shell` argument accepts either [`crate::Shell`] or [`crate::clap_complete::Shell`].
+/// If you need to tweak or prune the command tree before rendering, use
+/// [`render_clap_completion_from_command`] instead.
 ///
 /// # Errors
 ///
@@ -270,19 +287,61 @@ pub fn render_clap_completion<T: clap::CommandFactory>(
     shell: impl Into<Shell>,
     bin_name: &str,
 ) -> Result<Vec<u8>> {
-    use clap_complete::generate;
-    let generator = <clap_complete::Shell as TryFrom<Shell>>::try_from(shell.into())?;
     let mut command = T::command();
-    let mut output = Vec::new();
-    generate(generator, &mut command, bin_name, &mut output);
-    Ok(output)
+    render_clap_completion_bytes(shell, bin_name, &mut command)
+}
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+/// Renders a completion script from a prebuilt [`clap::Command`].
+///
+/// Use this when the caller needs to construct the real command tree first and then apply
+/// lightweight adjustments before rendering, such as adding build-specific flags or hiding an
+/// internal subcommand from completions.
+///
+/// This helper is intentionally optional so the core crate does not require `clap`.
+/// It only renders script bytes; installation and activation are still handled by [`install`].
+/// The `shell` argument accepts either [`crate::Shell`] or [`crate::clap_complete::Shell`].
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedShell`] for `Shell::Other(_)`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use clap::{Arg, CommandFactory, Parser};
+/// use shellcomp::render_clap_completion_from_command;
+///
+/// #[derive(Parser)]
+/// struct Cli {
+///     #[arg(long)]
+///     verbose: bool,
+/// }
+///
+/// let command = Cli::command().arg(Arg::new("profile").long("profile"));
+/// let script = render_clap_completion_from_command(
+///     shellcomp::clap_complete::Shell::Fish,
+///     "demo",
+///     command,
+/// )?;
+///
+/// assert!(!script.is_empty());
+/// # Ok::<(), shellcomp::Error>(())
+/// ```
+pub fn render_clap_completion_from_command(
+    shell: impl Into<Shell>,
+    bin_name: &str,
+    mut command: clap::Command,
+) -> Result<Vec<u8>> {
+    render_clap_completion_bytes(shell, bin_name, &mut command)
 }
 
 #[cfg(all(test, feature = "clap"))]
 mod clap_tests {
-    use clap::Parser;
+    use clap::{Arg, CommandFactory, Parser};
 
-    use super::render_clap_completion;
+    use super::{render_clap_completion, render_clap_completion_from_command};
     use crate::Shell;
 
     #[derive(Parser)]
@@ -310,9 +369,36 @@ mod clap_tests {
     }
 
     #[test]
+    fn renders_clap_completion_from_adjusted_command() {
+        let command = TestCli::command().arg(Arg::new("profile").long("profile"));
+        let script = render_clap_completion_from_command(Shell::Bash, "test-cli", command)
+            .expect("bash completion should render from an adjusted command");
+        let rendered = String::from_utf8(script).expect("completion output should be utf-8");
+
+        assert!(rendered.contains("test-cli"));
+        assert!(rendered.contains("--profile"));
+    }
+
+    #[test]
     fn rejects_other_shell_for_clap_generation() {
         let error = render_clap_completion::<TestCli>(Shell::Other("xonsh".to_owned()), "test-cli")
             .expect_err("unsupported shell should fail");
+
+        assert!(matches!(
+            error,
+            crate::Error::UnsupportedShell(Shell::Other(value)) if value == "xonsh"
+        ));
+    }
+
+    #[test]
+    fn rejects_other_shell_for_prebuilt_clap_command() {
+        let command = TestCli::command();
+        let error = render_clap_completion_from_command(
+            Shell::Other("xonsh".to_owned()),
+            "test-cli",
+            command,
+        )
+        .expect_err("unsupported shell should fail");
 
         assert!(matches!(
             error,

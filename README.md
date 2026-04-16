@@ -44,8 +44,8 @@ Once published, replace the path dependency with a version:
 shellcomp = "0.1.0"
 ```
 
-Enable `clap` integration if you want the library to render completions from `clap::CommandFactory`
-directly:
+Enable `clap` integration if you want the library to render completions from
+`clap::CommandFactory` or a prebuilt `clap::Command` directly:
 
 ```toml
 [dependencies]
@@ -103,6 +103,27 @@ convert it into `shellcomp::Shell` only when you need deployment:
 
 ```rust
 use shellcomp::clap_complete::Shell;
+```
+
+If you need to tweak the command tree before rendering, use
+`render_clap_completion_from_command`:
+
+```rust
+use clap::{Arg, CommandFactory, Parser};
+use shellcomp::render_clap_completion_from_command;
+
+#[derive(Parser)]
+struct Cli {
+    #[arg(long)]
+    verbose: bool,
+}
+
+let command = Cli::command().arg(Arg::new("profile").long("profile"));
+let script = render_clap_completion_from_command(
+    shellcomp::clap_complete::Shell::Fish,
+    "my-cli",
+    command,
+)?;
 ```
 
 If you need lower-level generator APIs such as `generate`, depend on `clap_complete` directly.

@@ -377,8 +377,8 @@ fn migrate_managed_blocks_rewrites_legacy_markers_via_public_api() {
 
 #[cfg(feature = "clap")]
 mod clap_tests {
-    use clap::Parser;
-    use shellcomp::{Error, Shell, render_clap_completion};
+    use clap::{Arg, Command, Parser};
+    use shellcomp::{Error, Shell, render_clap_completion, render_clap_completion_from_command};
 
     #[derive(Parser)]
     struct Cli {
@@ -405,6 +405,17 @@ mod clap_tests {
     }
 
     #[test]
+    fn render_clap_completion_from_command_is_available_from_public_api() {
+        let command = Command::new("demo").arg(Arg::new("profile").long("profile"));
+        let script = render_clap_completion_from_command(Shell::Bash, "demo", command)
+            .expect("bash completion should render");
+        let rendered = String::from_utf8(script).expect("rendered script should be utf-8");
+
+        assert!(rendered.contains("demo"));
+        assert!(rendered.contains("--profile"));
+    }
+
+    #[test]
     fn shell_converts_from_reexported_clap_complete_shell() {
         let shell: Shell = shellcomp::clap_complete::Shell::Zsh.into();
         assert_eq!(shell, Shell::Zsh);
@@ -414,6 +425,19 @@ mod clap_tests {
     fn render_clap_completion_rejects_other_shell_via_public_api() {
         let error = render_clap_completion::<Cli>(Shell::Other("xonsh".to_owned()), "demo")
             .expect_err("unsupported shell should fail");
+
+        assert!(matches!(
+            error,
+            Error::UnsupportedShell(Shell::Other(value)) if value == "xonsh"
+        ));
+    }
+
+    #[test]
+    fn render_clap_completion_from_command_rejects_other_shell_via_public_api() {
+        let command = Command::new("demo");
+        let error =
+            render_clap_completion_from_command(Shell::Other("xonsh".to_owned()), "demo", command)
+                .expect_err("unsupported shell should fail");
 
         assert!(matches!(
             error,

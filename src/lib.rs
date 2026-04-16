@@ -59,6 +59,8 @@
 //!   `shellcomp`-managed startup block.
 //! - [`render_clap_completion`] is available behind the `clap` feature for users who want the
 //!   crate to render completion bytes from `clap::CommandFactory`.
+//! - [`render_clap_completion_from_command`] is available behind the `clap` feature for users who
+//!   want to tweak a prebuilt `clap::Command` before rendering.
 //! - [`clap_complete`] is re-exported behind the `clap` feature so callers can use
 //!   `shellcomp::clap_complete::Shell` without pulling conflicting top-level `Shell` names into
 //!   the same scope manually.
@@ -215,6 +217,9 @@ mod tests;
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 pub use api::render_clap_completion;
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+pub use api::render_clap_completion_from_command;
 #[cfg(feature = "clap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
 /// Re-exported `clap_complete` shell type for callers that want a namespaced integration surface.
