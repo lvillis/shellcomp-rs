@@ -1,3 +1,8 @@
+## [0.1.13] - 2026-04-16
+
+### 🚀 Features
+
+- *(clap)* Render completions from prebuilt commands
 ## [0.1.12] - 2026-04-09
 
 ### 🚀 Features
@@ -14,6 +19,10 @@
 ### 🚜 Refactor
 
 - *(tests)* Unify structured failure assertions
+
+### ⚙️ Miscellaneous Tasks
+
+- Release shellcomp version 0.1.12
 ## [0.1.11] - 2026-04-03
 
 ### ⚙️ Miscellaneous Tasks
